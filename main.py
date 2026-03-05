@@ -1,7 +1,9 @@
-import os, uuid, time, io, logging
+import os, uuid, time, io, logging, re
 from contextlib import asynccontextmanager
 from typing import Optional
+from urllib.parse import urlparse, urljoin
 import httpx, openai
+import trafilatura
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, BackgroundTasks
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -81,6 +83,26 @@ async def process_doc(
         "started_at": time.time()
     }
     bg.add_task(pipeline, job_id, content, file.filename or "", document_id, notebook_id, callback_url)
+    return {"job_id": job_id, "status": "queued"}
+
+@app.post("/process-url")
+async def process_url(
+    bg: BackgroundTasks,
+    url: str = Form(...),
+    document_id: str = Form(...),
+    notebook_id: str = Form(...),
+    callback_url: str = Form(""),
+    authorization: str = Header(None)
+):
+    auth(authorization)
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "job_id": job_id, "status": "queued", "step": "",
+        "document_id": document_id, "notebook_id": notebook_id,
+        "filename": url, "chunks": 0, "error": None,
+        "started_at": time.time()
+    }
+    bg.add_task(url_pipeline, job_id, url, document_id, notebook_id, callback_url)
     return {"job_id": job_id, "status": "queued"}
 
 @app.get("/status/{job_id}")
@@ -171,6 +193,150 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url):
         log.info("Job %s: done, %d chunks stored", job_id, len(chunks))
         if callback_url:
             notify(callback_url, job_id, document_id, "ready", len(chunks), transcript_data=transcript_data)
+    except Exception as e:
+        log.error("Job %s failed: %s", job_id, str(e))
+        jobs[job_id]["status"] = "failed"
+        jobs[job_id]["error"] = str(e)
+        if callback_url:
+            notify(callback_url, job_id, document_id, "failed", 0, str(e))
+
+# --- URL Processing ---
+MAX_CRAWL_PAGES = 20
+CRAWL_DELAY = 1.0
+URL_TIMEOUT = 15
+URL_USER_AGENT = "TrainerBot/1.0"
+
+def normalize_url(url):
+    """URL normalisieren: Schema hinzufügen falls nötig."""
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url
+
+def is_domain_root(url):
+    """Prüft ob die URL nur eine Domain ist (kein spezifischer Pfad)."""
+    parsed = urlparse(url)
+    return parsed.path in ("", "/")
+
+def fetch_page(url):
+    """Einzelne Seite laden und Text mit trafilatura extrahieren."""
+    with httpx.Client(timeout=URL_TIMEOUT, follow_redirects=True) as c:
+        r = c.get(url, headers={"User-Agent": URL_USER_AGENT})
+        r.raise_for_status()
+        html = r.text
+    text = trafilatura.extract(html, include_comments=False, include_tables=True)
+    title = trafilatura.extract(html, output_format="xml")
+    # Title aus HTML extrahieren
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+    page_title = title_match.group(1).strip() if title_match else url
+    return text or "", page_title
+
+def discover_links(html, base_url):
+    """Links auf gleicher Domain aus HTML extrahieren."""
+    parsed_base = urlparse(base_url)
+    base_domain = parsed_base.netloc.replace("www.", "")
+    links = set()
+    # Einfaches <a href="..."> Pattern
+    for match in re.finditer(r'<a\s+[^>]*href=["\']([^"\'#]+)["\']', html, re.IGNORECASE):
+        href = match.group(1)
+        full_url = urljoin(base_url, href)
+        parsed = urlparse(full_url)
+        link_domain = parsed.netloc.replace("www.", "")
+        # Nur gleiche Domain, nur HTTP(S), keine Dateien
+        if link_domain != base_domain:
+            continue
+        if parsed.scheme not in ("http", "https"):
+            continue
+        skip_ext = (".pdf", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".zip", ".mp3",
+                     ".mp4", ".wav", ".doc", ".docx", ".xls", ".xlsx", ".css", ".js")
+        if any(parsed.path.lower().endswith(ext) for ext in skip_ext):
+            continue
+        # URL ohne Fragment und Query normalisieren
+        clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        if clean.endswith("/") and len(clean) > len(f"{parsed.scheme}://{parsed.netloc}/"):
+            clean = clean.rstrip("/")
+        links.add(clean)
+    # Basis-URL entfernen
+    base_clean = f"{parsed_base.scheme}://{parsed_base.netloc}{parsed_base.path}".rstrip("/")
+    links.discard(base_clean)
+    links.discard(base_clean + "/")
+    return list(links)[:MAX_CRAWL_PAGES]
+
+def url_pipeline(job_id, url, document_id, notebook_id, callback_url):
+    """URL(s) laden, Text extrahieren, chunken, embedden, speichern."""
+    try:
+        jobs[job_id]["status"] = "processing"
+        jobs[job_id]["step"] = "fetching"
+        url = normalize_url(url)
+        log.info("Job %s: fetching %s", job_id, url)
+
+        # Hauptseite laden
+        with httpx.Client(timeout=URL_TIMEOUT, follow_redirects=True) as c:
+            r = c.get(url, headers={"User-Agent": URL_USER_AGENT})
+            r.raise_for_status()
+            main_html = r.text
+
+        main_text, main_title = fetch_page(url)
+        all_texts = []
+        if main_text and len(main_text.strip()) > 10:
+            all_texts.append(f"=== {main_title} – {url} ===\n{main_text}")
+
+        # Bei Domain-Root: Unterseiten crawlen
+        if is_domain_root(url):
+            jobs[job_id]["step"] = "crawling"
+            links = discover_links(main_html, url)
+            log.info("Job %s: found %d links to crawl", job_id, len(links))
+            for i, link in enumerate(links):
+                try:
+                    time.sleep(CRAWL_DELAY)
+                    page_text, page_title = fetch_page(link)
+                    if page_text and len(page_text.strip()) > 10:
+                        all_texts.append(f"=== {page_title} – {link} ===\n{page_text}")
+                        log.info("Job %s: crawled %d/%d – %s (%d chars)",
+                                 job_id, i + 1, len(links), link, len(page_text))
+                    else:
+                        log.info("Job %s: skipped %s (no content)", job_id, link)
+                except Exception as ex:
+                    log.warning("Job %s: failed to fetch %s: %s", job_id, link, str(ex))
+
+        combined_text = "\n\n".join(all_texts)
+        if not combined_text or len(combined_text.strip()) < 10:
+            raise Exception(f"No text extracted from {url}")
+
+        log.info("Job %s: %d chars total from %d pages", job_id, len(combined_text), len(all_texts))
+
+        # Ab hier: gleiche Pipeline wie Datei-Upload
+        jobs[job_id]["step"] = "chunking"
+        chunks = chunk_text(combined_text)
+        log.info("Job %s: %d chunks", job_id, len(chunks))
+
+        jobs[job_id]["step"] = "embedding"
+        embeddings = embed([c["text"] for c in chunks])
+
+        qdrant.delete(
+            collection_name=COLLECTION,
+            points_selector=FilterSelector(
+                filter=Filter(must=[FieldCondition(key="document_id", match=MatchValue(value=document_id))])
+            )
+        )
+
+        jobs[job_id]["step"] = "storing"
+        points = [
+            PointStruct(id=str(uuid.uuid4()), vector=emb, payload={
+                "text": ch["text"], "notebook_id": notebook_id,
+                "document_id": document_id, "filename": url, "chunk_index": i
+            })
+            for i, (ch, emb) in enumerate(zip(chunks, embeddings))
+        ]
+        for i in range(0, len(points), 100):
+            qdrant.upsert(collection_name=COLLECTION, points=points[i:i + 100])
+
+        jobs[job_id]["status"] = "ready"
+        jobs[job_id]["step"] = "done"
+        jobs[job_id]["chunks"] = len(chunks)
+        log.info("Job %s: done, %d chunks stored from URL", job_id, len(chunks))
+        if callback_url:
+            notify(callback_url, job_id, document_id, "ready", len(chunks))
     except Exception as e:
         log.error("Job %s failed: %s", job_id, str(e))
         jobs[job_id]["status"] = "failed"
