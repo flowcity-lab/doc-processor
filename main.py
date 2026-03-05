@@ -222,17 +222,17 @@ def transcribe_assemblyai(content, filename):
     log.info("AssemblyAI: uploaded → %s", audio_url[:80])
 
     # 2. Transkription starten
+    speech_model = ASSEMBLYAI_SPEECH_MODEL if ASSEMBLYAI_SPEECH_MODEL else "universal-3-pro"
     transcript_config = {
         "audio_url": audio_url,
         "speaker_labels": ASSEMBLYAI_SPEAKER_LABELS,
+        "speech_models": [speech_model],
     }
     if ASSEMBLYAI_LANGUAGE_DETECTION:
         transcript_config["language_detection"] = True
     if ASSEMBLYAI_LANGUAGE:
         transcript_config["language_code"] = ASSEMBLYAI_LANGUAGE
         transcript_config.pop("language_detection", None)
-    if ASSEMBLYAI_SPEECH_MODEL:
-        transcript_config["speech_models"] = [ASSEMBLYAI_SPEECH_MODEL]
 
     log.info("AssemblyAI: transcript config: %s", transcript_config)
     start_resp = httpx.post(
