@@ -105,6 +105,24 @@ async def process_url(
     bg.add_task(url_pipeline, job_id, url, document_id, notebook_id, callback_url)
     return {"job_id": job_id, "status": "queued"}
 
+@app.post("/research-url")
+async def research_url(
+    bg: BackgroundTasks,
+    url: str = Form(...),
+    callback_url: str = Form(""),
+    authorization: str = Header(None)
+):
+    auth(authorization)
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "job_id": job_id, "status": "queued", "step": "",
+        "document_id": "", "notebook_id": "",
+        "filename": url, "chunks": 0, "error": None,
+        "started_at": time.time(), "result_text": None
+    }
+    bg.add_task(research_pipeline, job_id, url, callback_url)
+    return {"job_id": job_id, "status": "queued"}
+
 @app.get("/status/{job_id}")
 async def get_status(job_id: str, authorization: str = Header(None)):
     auth(authorization)
@@ -502,4 +520,133 @@ def notify(url, job_id, document_id, status, chunks, error="", transcript_data=N
                 headers={"Authorization": f"Bearer {API_SECRET}"})
     except Exception as e:
         log.error("Callback failed: %s", str(e))
+
+
+# --- Research Pipeline (Scrape + AI Summary) ---
+
+RESEARCH_SYSTEM_PROMPT = """Du bist ein Experte für die Erstellung von Wissensdokumenten für KI-Telefonassistenten.
+Deine Aufgabe ist es, aus dem gegebenen Website-Inhalt ein umfangreiches, strukturiertes Wissensdokument zu erstellen.
+
+Das Dokument soll folgende Abschnitte enthalten (soweit Informationen vorhanden sind):
+
+### Über das Unternehmen
+Allgemeine Informationen, Geschichte, Mission, Werte
+
+### Leistungen & Angebote
+Alle Produkte, Dienstleistungen, Pakete detailliert beschreiben
+
+### Öffnungszeiten
+Tagesweise aufschlüsseln wenn vorhanden
+
+### Kontaktdaten
+Telefon, E-Mail, Adresse, Social Media
+
+### Häufige Fragen (FAQ)
+Typische Kundenfragen und Antworten ableiten
+
+### Preise & Konditionen
+Preislisten, Zahlungsbedingungen wenn vorhanden
+
+### Besonderheiten & Alleinstellungsmerkmale
+Was macht das Unternehmen besonders?
+
+### Team & Ansprechpartner
+Mitarbeiter, Geschäftsführung wenn erwähnt
+
+### Wichtiges Wissen
+Alles weitere das ein Telefonassistent wissen sollte
+
+REGELN:
+- Verwende Markdown-Formatierung mit ### für Hauptabschnitte
+- Schreibe in der gleichen Sprache wie der Website-Inhalt
+- Sei so detailliert und umfangreich wie möglich
+- Formuliere Informationen so, dass ein KI-Telefonassistent sie direkt verwenden kann
+- Lasse Abschnitte weg, für die keine Informationen vorhanden sind
+- Erfinde KEINE Informationen – verwende nur was auf der Website steht
+- Maximal 8000 Zeichen"""
+
+def research_pipeline(job_id, url, callback_url):
+    """URL(s) scrapen, AI-Zusammenfassung erstellen, Ergebnis per Callback senden."""
+    try:
+        jobs[job_id]["status"] = "processing"
+        jobs[job_id]["step"] = "fetching"
+        url = normalize_url(url)
+        log.info("Research %s: fetching %s", job_id, url)
+
+        # Hauptseite laden
+        with httpx.Client(timeout=URL_TIMEOUT, follow_redirects=True) as c:
+            r = c.get(url, headers={"User-Agent": URL_USER_AGENT})
+            r.raise_for_status()
+            main_html = r.text
+
+        main_text, main_title = fetch_page(url)
+        all_texts = []
+        if main_text and len(main_text.strip()) > 10:
+            all_texts.append(f"=== {main_title} – {url} ===\n{main_text}")
+
+        # Bei Domain-Root: Unterseiten crawlen
+        if is_domain_root(url):
+            jobs[job_id]["step"] = "crawling"
+            links = discover_links(main_html, url)
+            log.info("Research %s: found %d links to crawl", job_id, len(links))
+            for i, link in enumerate(links):
+                try:
+                    time.sleep(CRAWL_DELAY)
+                    page_text, page_title = fetch_page(link)
+                    if page_text and len(page_text.strip()) > 10:
+                        all_texts.append(f"=== {page_title} – {link} ===\n{page_text}")
+                        log.info("Research %s: crawled %d/%d – %s (%d chars)",
+                                 job_id, i + 1, len(links), link, len(page_text))
+                except Exception as ex:
+                    log.warning("Research %s: failed to fetch %s: %s", job_id, link, str(ex))
+
+        combined_text = "\n\n".join(all_texts)
+        if not combined_text or len(combined_text.strip()) < 10:
+            raise Exception(f"Keine Inhalte von {url} extrahiert")
+
+        log.info("Research %s: %d chars total from %d pages", job_id, len(combined_text), len(all_texts))
+
+        # AI-Zusammenfassung erstellen
+        jobs[job_id]["step"] = "summarizing"
+        # Text auf max. 80000 Zeichen begrenzen für API
+        input_text = combined_text[:80000]
+
+        response = oai.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": RESEARCH_SYSTEM_PROMPT},
+                {"role": "user", "content": f"Erstelle ein umfangreiches Wissensdokument basierend auf folgendem Website-Inhalt:\n\n{input_text}"}
+            ],
+            temperature=0.3,
+            max_tokens=4000
+        )
+        result_text = response.choices[0].message.content.strip()
+        log.info("Research %s: AI summary generated, %d chars", job_id, len(result_text))
+
+        jobs[job_id]["status"] = "ready"
+        jobs[job_id]["step"] = "done"
+        jobs[job_id]["result_text"] = result_text
+
+        if callback_url:
+            notify_research(callback_url, job_id, "ready", result_text)
+
+    except Exception as e:
+        log.error("Research %s failed: %s", job_id, str(e))
+        jobs[job_id]["status"] = "failed"
+        jobs[job_id]["error"] = str(e)
+        if callback_url:
+            notify_research(callback_url, job_id, "failed", "", str(e))
+
+
+def notify_research(url, job_id, status, result_text="", error=""):
+    try:
+        with httpx.Client(timeout=30) as c:
+            c.post(url, json={
+                "job_id": job_id,
+                "status": status,
+                "result_text": result_text,
+                "error": error,
+            }, headers={"Authorization": f"Bearer {API_SECRET}"})
+    except Exception as e:
+        log.error("Research callback failed: %s", str(e))
 
