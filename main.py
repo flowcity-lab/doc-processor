@@ -166,6 +166,8 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url):
         jobs[job_id]["status"] = "ready"
         jobs[job_id]["step"] = "done"
         jobs[job_id]["chunks"] = len(chunks)
+        if transcript_data:
+            jobs[job_id]["transcript"] = transcript_data
         log.info("Job %s: done, %d chunks stored", job_id, len(chunks))
         if callback_url:
             notify(callback_url, job_id, document_id, "ready", len(chunks), transcript_data=transcript_data)
