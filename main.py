@@ -1,4 +1,4 @@
-import os, uuid, time, io, logging, re
+import os, uuid, time, io, logging, re, asyncio
 from contextlib import asynccontextmanager
 from typing import Optional
 from urllib.parse import urlparse, urljoin
@@ -37,6 +37,22 @@ jobs = {}
 qdrant = None
 oai = None
 
+# TTL für abgeschlossene Jobs: nach 1 Stunde aus dem Speicher entfernen
+JOB_TTL_SECONDS = 3600
+
+def cleanup_old_jobs():
+    """Entfernt abgeschlossene/fehlgeschlagene Jobs die älter als JOB_TTL_SECONDS sind."""
+    now = time.time()
+    expired = [
+        jid for jid, j in jobs.items()
+        if j.get("status") in ("ready", "failed")
+        and (now - j.get("started_at", now)) > JOB_TTL_SECONDS
+    ]
+    for jid in expired:
+        del jobs[jid]
+    if expired:
+        log.info("Cleanup: %d alte Jobs entfernt, %d verbleibend", len(expired), len(jobs))
+
 AUDIO_EXTENSIONS = ("mp3", "wav", "m4a", "ogg", "webm")
 
 @asynccontextmanager
@@ -52,7 +68,16 @@ async def lifespan(app: FastAPI):
         qdrant.create_payload_index(COLLECTION, "notebook_id", "keyword")
         qdrant.create_payload_index(COLLECTION, "document_id", "keyword")
     log.info("DPS ready. Qdrant=%s Tika=%s", QDRANT_HOST, TIKA_HOST)
+
+    # Periodischer Cleanup-Task für alte Jobs
+    async def periodic_cleanup():
+        while True:
+            await asyncio.sleep(300)  # alle 5 Minuten
+            cleanup_old_jobs()
+
+    cleanup_task = asyncio.create_task(periodic_cleanup())
     yield
+    cleanup_task.cancel()
 
 app = FastAPI(title="Document Processing Service", lifespan=lifespan)
 
