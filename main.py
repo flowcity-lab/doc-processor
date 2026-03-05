@@ -261,17 +261,81 @@ def is_domain_root(url):
     parsed = urlparse(url)
     return parsed.path in ("", "/")
 
+def extract_html_contact_info(html):
+    """Kontaktdaten aus Header/Footer/Nav des HTML extrahieren, die trafilatura überspringt."""
+    import html as html_module
+
+    contact_parts = []
+
+    # Footer, Header und Kontakt-Sektionen aus dem HTML extrahieren
+    # Suche nach <footer>, <header> und Elementen mit typischen Kontakt-IDs/Klassen
+    patterns = [
+        r'<footer[^>]*>(.*?)</footer>',
+        r'<div[^>]*(?:class|id)\s*=\s*["\'][^"\']*(?:contact|kontakt|footer|address|impressum|imprint)[^"\']*["\'][^>]*>(.*?)</div>',
+        r'<section[^>]*(?:class|id)\s*=\s*["\'][^"\']*(?:contact|kontakt|footer|address|impressum|imprint)[^"\']*["\'][^>]*>(.*?)</section>',
+        r'<address[^>]*>(.*?)</address>',
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
+        for match in matches:
+            # HTML-Tags entfernen, aber Zeilenumbrüche bei Block-Elementen einfügen
+            clean = re.sub(r'<br\s*/?>|</p>|</div>|</li>|</h[1-6]>', '\n', match)
+            clean = re.sub(r'<[^>]+>', ' ', clean)
+            clean = html_module.unescape(clean)
+            # Mehrfache Whitespaces bereinigen
+            clean = re.sub(r'[ \t]+', ' ', clean)
+            clean = re.sub(r'\n\s*\n', '\n', clean)
+            clean = clean.strip()
+            if clean and len(clean) > 5:
+                contact_parts.append(clean)
+
+    # Auch nach E-Mail-Adressen und Telefonnummern im gesamten HTML suchen
+    emails = set(re.findall(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', html))
+    phones = set(re.findall(r'(?:tel:|phone:|telefon:|fon:)?\s*[+]?[\d\s\-/().]{7,20}', html, re.IGNORECASE))
+    # Nur plausible Telefonnummern behalten (mind. 7 Ziffern)
+    phones = {p.strip() for p in phones if sum(c.isdigit() for c in p) >= 7}
+
+    extra_info = []
+    if emails:
+        extra_info.append("E-Mail: " + ", ".join(sorted(emails)))
+    if phones:
+        extra_info.append("Telefon: " + ", ".join(sorted(phones)))
+
+    if extra_info:
+        contact_parts.append("\n".join(extra_info))
+
+    if not contact_parts:
+        return ""
+
+    # Deduplizieren (Footer kann mehrfach matchen)
+    seen = set()
+    unique = []
+    for part in contact_parts:
+        normalized = part.lower().strip()
+        if normalized not in seen:
+            seen.add(normalized)
+            unique.append(part)
+
+    return "\n\n--- Kontaktbereich ---\n" + "\n\n".join(unique)
+
+
 def fetch_page(url):
     """Einzelne Seite laden und Text mit trafilatura extrahieren."""
     with httpx.Client(timeout=URL_TIMEOUT, follow_redirects=True) as c:
         r = c.get(url, headers={"User-Agent": URL_USER_AGENT})
         r.raise_for_status()
         html = r.text
-    text = trafilatura.extract(html, include_comments=False, include_tables=True)
-    title = trafilatura.extract(html, output_format="xml")
+    text = trafilatura.extract(html, include_comments=False, include_tables=True, favor_recall=True)
     # Title aus HTML extrahieren
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
     page_title = title_match.group(1).strip() if title_match else url
+
+    # Kontaktdaten aus Header/Footer anhängen (trafilatura überspringt diese)
+    contact_info = extract_html_contact_info(html)
+    if contact_info:
+        text = (text or "") + "\n\n" + contact_info
+
     return text or "", page_title
 
 def discover_links(html, base_url):
