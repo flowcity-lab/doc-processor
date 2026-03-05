@@ -613,7 +613,7 @@ def notify(url, job_id, document_id, status, chunks, error="", transcript_data=N
 
 # --- Research Pipeline (Scrape + AI Summary) ---
 
-RESEARCH_SYSTEM_PROMPT = """Du bist ein Experte für die Erstellung von Wissensdokumenten für KI-Telefonassistenten.
+RESEARCH_SYSTEM_PROMPT = """Du bist ein Experte für die Erstellung von strukturierten Wissensdokumenten.
 Deine Aufgabe ist es, aus dem gegebenen Website-Inhalt ein umfangreiches, strukturiertes Wissensdokument zu erstellen.
 
 Das Dokument soll folgende Abschnitte enthalten (soweit Informationen vorhanden sind):
@@ -643,13 +643,13 @@ Was macht das Unternehmen besonders?
 Mitarbeiter, Geschäftsführung wenn erwähnt
 
 ### Wichtiges Wissen
-Alles weitere das ein Telefonassistent wissen sollte
+Alles weitere Wichtige über das Unternehmen
 
 REGELN:
 - Verwende Markdown-Formatierung mit ### für Hauptabschnitte
 - Schreibe in der gleichen Sprache wie der Website-Inhalt
 - Sei so detailliert und umfangreich wie möglich
-- Formuliere Informationen so, dass ein KI-Telefonassistent sie direkt verwenden kann
+- Formuliere Informationen klar und präzise, sodass sie direkt als Wissensquelle verwendet werden können
 - Lasse Abschnitte weg, für die keine Informationen vorhanden sind
 - Erfinde KEINE Informationen – verwende nur was auf der Website steht
 - Maximal 8000 Zeichen"""
