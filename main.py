@@ -209,12 +209,13 @@ def transcribe_whisper(content, filename):
 def transcribe_assemblyai(content, filename):
     """AssemblyAI: Upload → Transcribe → Poll → Return mit Diarization."""
     base_url = "https://api.assemblyai.com/v2"
-    headers = {"authorization": ASSEMBLYAI_API_KEY}
+    headers = {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
+    upload_headers = {"authorization": ASSEMBLYAI_API_KEY}
 
     # 1. Audio hochladen
     log.info("AssemblyAI: uploading %s (%d bytes)", filename, len(content))
     upload_resp = httpx.post(
-        f"{base_url}/upload", headers=headers, content=content, timeout=300
+        f"{base_url}/upload", headers=upload_headers, content=content, timeout=300
     )
     upload_resp.raise_for_status()
     audio_url = upload_resp.json()["upload_url"]
@@ -231,12 +232,15 @@ def transcribe_assemblyai(content, filename):
         transcript_config["language_code"] = ASSEMBLYAI_LANGUAGE
         transcript_config.pop("language_detection", None)
     if ASSEMBLYAI_SPEECH_MODEL:
-        transcript_config["speech_model"] = ASSEMBLYAI_SPEECH_MODEL
+        transcript_config["speech_models"] = [ASSEMBLYAI_SPEECH_MODEL]
 
+    log.info("AssemblyAI: transcript config: %s", transcript_config)
     start_resp = httpx.post(
         f"{base_url}/transcript", headers=headers, json=transcript_config, timeout=30
     )
-    start_resp.raise_for_status()
+    if start_resp.status_code != 200:
+        log.error("AssemblyAI: transcript start failed: %s %s", start_resp.status_code, start_resp.text)
+        start_resp.raise_for_status()
     transcript_id = start_resp.json()["id"]
     log.info("AssemblyAI: transcription started → %s", transcript_id)
 
