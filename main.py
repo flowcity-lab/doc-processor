@@ -35,7 +35,7 @@ jobs = {}
 qdrant = None
 oai = None
 
-AUDIO_EXTENSIONS = ("mp3", "wav", "m4a", "ogg", "webm", "mp4", "mpeg", "mpga")
+AUDIO_EXTENSIONS = ("mp3", "wav", "m4a", "ogg", "webm")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
