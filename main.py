@@ -20,6 +20,14 @@ VECTOR_DIM = 1536
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
 
+# === Audio Transcription Config ===
+TRANSCRIPTION_PROVIDER = os.environ.get("TRANSCRIPTION_PROVIDER", "assemblyai")  # assemblyai | whisper
+ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY", "")
+ASSEMBLYAI_SPEECH_MODEL = os.environ.get("ASSEMBLYAI_SPEECH_MODEL", "")  # leer = default (universal-3-pro)
+ASSEMBLYAI_SPEAKER_LABELS = os.environ.get("ASSEMBLYAI_SPEAKER_LABELS", "true").lower() == "true"
+ASSEMBLYAI_LANGUAGE_DETECTION = os.environ.get("ASSEMBLYAI_LANGUAGE_DETECTION", "true").lower() == "true"
+ASSEMBLYAI_LANGUAGE = os.environ.get("ASSEMBLYAI_LANGUAGE", "")  # leer = auto-detect
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dps")
 
@@ -124,9 +132,10 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url):
     try:
         jobs[job_id]["status"] = "processing"
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        transcript_data = None
         if ext in AUDIO_EXTENSIONS:
             jobs[job_id]["step"] = "transcribing"
-            text = transcribe(content, filename)
+            text, transcript_data = transcribe(content, filename)
         else:
             jobs[job_id]["step"] = "extracting"
             text = extract(content)
@@ -159,7 +168,7 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url):
         jobs[job_id]["chunks"] = len(chunks)
         log.info("Job %s: done, %d chunks stored", job_id, len(chunks))
         if callback_url:
-            notify(callback_url, job_id, document_id, "ready", len(chunks))
+            notify(callback_url, job_id, document_id, "ready", len(chunks), transcript_data=transcript_data)
     except Exception as e:
         log.error("Job %s failed: %s", job_id, str(e))
         jobs[job_id]["status"] = "failed"
@@ -174,9 +183,116 @@ def extract(content):
         return r.text
 
 def transcribe(content, filename):
+    """Transkribiert Audio – gibt (text, transcript_data) zurück."""
+    if TRANSCRIPTION_PROVIDER == "assemblyai":
+        return transcribe_assemblyai(content, filename)
+    else:
+        return transcribe_whisper(content, filename)
+
+def transcribe_whisper(content, filename):
+    """Fallback: OpenAI Whisper (kein Diarization)."""
     f = io.BytesIO(content)
     f.name = filename
-    return oai.audio.transcriptions.create(model="whisper-1", file=f).text
+    result = oai.audio.transcriptions.create(model="whisper-1", file=f)
+    transcript_data = {
+        "full_text": result.text,
+        "utterances": [{"speaker": "A", "text": result.text, "start": 0, "end": 0}],
+        "speakers_map": {"A": "Sprecher A"},
+        "language": None,
+        "duration_ms": None,
+        "speakers_count": 1,
+        "provider": "whisper",
+        "provider_job_id": None,
+    }
+    return result.text, transcript_data
+
+def transcribe_assemblyai(content, filename):
+    """AssemblyAI: Upload → Transcribe → Poll → Return mit Diarization."""
+    base_url = "https://api.assemblyai.com/v2"
+    headers = {"authorization": ASSEMBLYAI_API_KEY}
+
+    # 1. Audio hochladen
+    log.info("AssemblyAI: uploading %s (%d bytes)", filename, len(content))
+    upload_resp = httpx.post(
+        f"{base_url}/upload", headers=headers, content=content, timeout=300
+    )
+    upload_resp.raise_for_status()
+    audio_url = upload_resp.json()["upload_url"]
+    log.info("AssemblyAI: uploaded → %s", audio_url[:80])
+
+    # 2. Transkription starten
+    transcript_config = {
+        "audio_url": audio_url,
+        "speaker_labels": ASSEMBLYAI_SPEAKER_LABELS,
+    }
+    if ASSEMBLYAI_LANGUAGE_DETECTION:
+        transcript_config["language_detection"] = True
+    if ASSEMBLYAI_LANGUAGE:
+        transcript_config["language_code"] = ASSEMBLYAI_LANGUAGE
+        transcript_config.pop("language_detection", None)
+    if ASSEMBLYAI_SPEECH_MODEL:
+        transcript_config["speech_model"] = ASSEMBLYAI_SPEECH_MODEL
+
+    start_resp = httpx.post(
+        f"{base_url}/transcript", headers=headers, json=transcript_config, timeout=30
+    )
+    start_resp.raise_for_status()
+    transcript_id = start_resp.json()["id"]
+    log.info("AssemblyAI: transcription started → %s", transcript_id)
+
+    # 3. Polling bis fertig
+    poll_url = f"{base_url}/transcript/{transcript_id}"
+    while True:
+        time.sleep(5)
+        poll_resp = httpx.get(poll_url, headers=headers, timeout=30)
+        poll_resp.raise_for_status()
+        data = poll_resp.json()
+        status = data["status"]
+        if status == "completed":
+            break
+        elif status == "error":
+            raise Exception(f"AssemblyAI error: {data.get('error', 'Unknown')}")
+        log.info("AssemblyAI: polling %s → %s", transcript_id, status)
+
+    # 4. Ergebnis formatieren
+    full_text = data.get("text", "")
+    utterances_raw = data.get("utterances", [])
+    duration_ms = data.get("audio_duration", 0)
+    if duration_ms:
+        duration_ms = int(duration_ms * 1000)  # Sekunden → ms
+    language = data.get("language_code", None)
+
+    # Sprecher sammeln
+    speakers = set()
+    utterances = []
+    for u in utterances_raw:
+        speaker = u.get("speaker", "A")
+        speakers.add(speaker)
+        utterances.append({
+            "speaker": speaker,
+            "text": u.get("text", ""),
+            "start": u.get("start", 0),
+            "end": u.get("end", 0),
+        })
+
+    # Default-Sprechernamen
+    speakers_map = {s: f"Sprecher {s}" for s in sorted(speakers)}
+
+    transcript_data = {
+        "full_text": full_text,
+        "utterances": utterances,
+        "speakers_map": speakers_map,
+        "language": language,
+        "duration_ms": duration_ms,
+        "speakers_count": len(speakers),
+        "provider": "assemblyai",
+        "provider_job_id": transcript_id,
+    }
+
+    log.info("AssemblyAI: done. %d utterances, %d speakers, lang=%s",
+             len(utterances), len(speakers), language)
+
+    return full_text, transcript_data
 
 def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     text = text.strip()
@@ -201,11 +317,16 @@ def embed(texts):
         all_emb.extend([d.embedding for d in resp.data])
     return all_emb
 
-def notify(url, job_id, document_id, status, chunks, error=""):
+def notify(url, job_id, document_id, status, chunks, error="", transcript_data=None):
     try:
-        with httpx.Client(timeout=10) as c:
-            c.post(url, json={"job_id": job_id, "document_id": document_id,
-                "status": status, "chunks": chunks, "error": error},
+        payload = {
+            "job_id": job_id, "document_id": document_id,
+            "status": status, "chunks": chunks, "error": error,
+        }
+        if transcript_data:
+            payload["transcript"] = transcript_data
+        with httpx.Client(timeout=30) as c:
+            c.post(url, json=payload,
                 headers={"Authorization": f"Bearer {API_SECRET}"})
     except Exception as e:
         log.error("Callback failed: %s", str(e))
