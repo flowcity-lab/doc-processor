@@ -27,6 +27,7 @@ TRANSCRIPTION_PROVIDER = os.environ.get("TRANSCRIPTION_PROVIDER", "assemblyai") 
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY", "")
 ASSEMBLYAI_SPEECH_MODEL = os.environ.get("ASSEMBLYAI_SPEECH_MODEL", "")  # leer = default (universal-3-pro)
 ASSEMBLYAI_SPEAKER_LABELS = os.environ.get("ASSEMBLYAI_SPEAKER_LABELS", "true").lower() == "true"
+ASSEMBLYAI_SPEAKERS_EXPECTED = int(os.environ.get("ASSEMBLYAI_SPEAKERS_EXPECTED", "0"))  # 0 = auto-detect
 ASSEMBLYAI_LANGUAGE_DETECTION = os.environ.get("ASSEMBLYAI_LANGUAGE_DETECTION", "true").lower() == "true"
 ASSEMBLYAI_LANGUAGE = os.environ.get("ASSEMBLYAI_LANGUAGE", "")  # leer = auto-detect
 ASSEMBLYAI_PROMPT = os.environ.get("ASSEMBLYAI_PROMPT", "")  # freier Steuerungs-Prompt für das Modell
@@ -500,12 +501,20 @@ def transcribe_assemblyai(content, filename):
     log.info("AssemblyAI: uploaded → %s", audio_url[:80])
 
     # 2. Transkription starten
-    speech_model = ASSEMBLYAI_SPEECH_MODEL if ASSEMBLYAI_SPEECH_MODEL else "universal-3-pro"
+    # speech_models als Array: universal-3-pro zuerst, universal-2 als Fallback
+    # (wichtig für Speaker Labels: universal-2 als Fallback sichert Diarization ab)
+    primary_model = ASSEMBLYAI_SPEECH_MODEL if ASSEMBLYAI_SPEECH_MODEL else "universal-3-pro"
+    speech_models = [primary_model]
+    if primary_model == "universal-3-pro":
+        speech_models.append("universal-2")
+
     transcript_config = {
         "audio_url": audio_url,
         "speaker_labels": ASSEMBLYAI_SPEAKER_LABELS,
-        "speech_models": [speech_model],
+        "speech_models": speech_models,
     }
+    if ASSEMBLYAI_SPEAKER_LABELS and ASSEMBLYAI_SPEAKERS_EXPECTED > 0:
+        transcript_config["speakers_expected"] = ASSEMBLYAI_SPEAKERS_EXPECTED
     if ASSEMBLYAI_LANGUAGE_DETECTION:
         transcript_config["language_detection"] = True
     if ASSEMBLYAI_LANGUAGE:
