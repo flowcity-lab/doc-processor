@@ -554,17 +554,37 @@ def transcribe_deepgram(content, filename):
 
     # Utterances mit Speaker-Info
     utterances_raw = data.get("results", {}).get("utterances", [])
+
+    # Deepgram liefert Speaker-IDs als int (0, 1, 2...) → auf Buchstaben (A, B, C...) mappen
+    # damit das Frontend die Farben korrekt zuordnet (speakerColors: {A:..., B:..., C:...})
+    _spk_letter_cache = {}
+    def _speaker_to_letter(spk_id):
+        if spk_id not in _spk_letter_cache:
+            idx = len(_spk_letter_cache)
+            _spk_letter_cache[spk_id] = chr(ord("A") + idx) if idx < 26 else f"S{idx}"
+        return _spk_letter_cache[spk_id]
+
     speakers = set()
-    utterances = []
+    raw_utterances = []
     for u in utterances_raw:
-        speaker = str(u.get("speaker", 0))
+        speaker = _speaker_to_letter(u.get("speaker", 0))
         speakers.add(speaker)
-        utterances.append({
+        raw_utterances.append({
             "speaker": speaker,
             "text": u.get("transcript", ""),
             "start": int(u.get("start", 0) * 1000),  # Sekunden → ms
             "end": int(u.get("end", 0) * 1000),
         })
+
+    # Aufeinanderfolgende Utterances desselben Sprechers zusammenfügen
+    utterances = []
+    for utt in raw_utterances:
+        if utterances and utterances[-1]["speaker"] == utt["speaker"]:
+            # Zusammenführen: Text anhängen, End-Zeit aktualisieren
+            utterances[-1]["text"] += " " + utt["text"]
+            utterances[-1]["end"] = utt["end"]
+        else:
+            utterances.append(dict(utt))
 
     # Metadata
     metadata = data.get("metadata", {})
@@ -583,7 +603,7 @@ def transcribe_deepgram(content, filename):
     if not language and DEEPGRAM_LANGUAGE:
         language = DEEPGRAM_LANGUAGE
 
-    speakers_map = {s: f"Sprecher {int(s)+1}" for s in sorted(speakers)}
+    speakers_map = {s: f"Sprecher {s}" for s in sorted(speakers)}
 
     transcript_data = {
         "full_text": full_text,
@@ -596,8 +616,8 @@ def transcribe_deepgram(content, filename):
         "provider_job_id": request_id,
     }
 
-    log.info("Deepgram: done. %d utterances, %d speakers, lang=%s",
-             len(utterances), len(speakers), language)
+    log.info("Deepgram: done. %d utterances (merged from %d), %d speakers, lang=%s",
+             len(utterances), len(raw_utterances), len(speakers), language)
 
     return full_text, transcript_data
 
