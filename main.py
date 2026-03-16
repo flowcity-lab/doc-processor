@@ -29,6 +29,9 @@ ASSEMBLYAI_SPEECH_MODEL = os.environ.get("ASSEMBLYAI_SPEECH_MODEL", "")  # leer 
 ASSEMBLYAI_SPEAKER_LABELS = os.environ.get("ASSEMBLYAI_SPEAKER_LABELS", "true").lower() == "true"
 ASSEMBLYAI_LANGUAGE_DETECTION = os.environ.get("ASSEMBLYAI_LANGUAGE_DETECTION", "true").lower() == "true"
 ASSEMBLYAI_LANGUAGE = os.environ.get("ASSEMBLYAI_LANGUAGE", "")  # leer = auto-detect
+ASSEMBLYAI_PROMPT = os.environ.get("ASSEMBLYAI_PROMPT", "")  # freier Steuerungs-Prompt für das Modell
+ASSEMBLYAI_KEYTERMS = os.environ.get("ASSEMBLYAI_KEYTERMS", "")  # kommagetrennte Fachbegriffe/Eigennamen
+ASSEMBLYAI_TEMPERATURE = float(os.environ.get("ASSEMBLYAI_TEMPERATURE", "0"))  # 0 = deterministisch
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dps")
@@ -508,6 +511,12 @@ def transcribe_assemblyai(content, filename):
     if ASSEMBLYAI_LANGUAGE:
         transcript_config["language_code"] = ASSEMBLYAI_LANGUAGE
         transcript_config.pop("language_detection", None)
+    if ASSEMBLYAI_PROMPT:
+        transcript_config["prompt"] = ASSEMBLYAI_PROMPT
+    if ASSEMBLYAI_KEYTERMS:
+        transcript_config["keyterms_prompt"] = [k.strip() for k in ASSEMBLYAI_KEYTERMS.split(",") if k.strip()]
+    if ASSEMBLYAI_TEMPERATURE is not None:
+        transcript_config["temperature"] = ASSEMBLYAI_TEMPERATURE
 
     log.info("AssemblyAI: transcript config: %s", transcript_config)
     start_resp = httpx.post(
