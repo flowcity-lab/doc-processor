@@ -1,4 +1,4 @@
-import os, uuid, time, io, logging, re, asyncio
+import os, uuid, time, io, logging, re, asyncio, subprocess, tempfile
 from contextlib import asynccontextmanager
 from typing import Optional
 from urllib.parse import urlparse, urljoin
@@ -206,12 +206,63 @@ async def delete_doc(document_id: str, authorization: str = Header(None)):
     )
     return {"status": "deleted", "document_id": document_id}
 
+def prepare_audio(content, filename):
+    """Konvertiert jedes Audio-Format zu MP3 und optimiert für STT via FFmpeg.
+    - Rauschunterdrückung (afftdn)
+    - Tiefes Brummen entfernen (highpass)
+    - Hochfrequentes Rauschen entfernen (lowpass)
+    - Lautstärke-Normalisierung (loudnorm, EBU R128)
+    - Kanäle bleiben erhalten (wichtig für Speaker-Diarization!)
+    """
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "mp3"
+    src_path = None
+    out_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as src:
+            src.write(content)
+            src_path = src.name
+        out_path = src_path + ".mp3"
+
+        cmd = [
+            "ffmpeg", "-y", "-i", src_path,
+            "-vn",                                          # kein Video
+            "-af", ",".join([
+                "highpass=f=80",                            # Brummen/Wind < 80 Hz entfernen
+                "lowpass=f=8000",                           # Hochfrequentes Rauschen > 8 kHz entfernen
+                "afftdn=nf=-25",                            # FFT-basierte Rauschunterdrückung
+                "loudnorm=I=-16:TP=-1.5:LRA=11",           # EBU R128 Lautstärke-Normalisierung
+            ]),
+            "-ar", "16000",                                 # 16 kHz Sample Rate (optimal für STT)
+            "-b:a", "128k",                                 # 128 kbps (ausreichend für Sprache)
+            "-f", "mp3",
+            out_path,
+        ]
+        log.info("FFmpeg: preparing %s (%d bytes) → %s", filename, len(content), " ".join(cmd[6:]))
+        result = subprocess.run(cmd, capture_output=True, timeout=600)
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            log.error("FFmpeg failed (rc=%d): %s", result.returncode, stderr[-500:])
+            raise Exception(f"FFmpeg conversion failed: {stderr[-200:]}")
+
+        with open(out_path, "rb") as f:
+            converted = f.read()
+        new_filename = filename.rsplit(".", 1)[0] + ".mp3"
+        log.info("FFmpeg: %s → %s (%d → %d bytes)", filename, new_filename, len(content), len(converted))
+        return converted, new_filename
+    finally:
+        if src_path and os.path.exists(src_path):
+            os.unlink(src_path)
+        if out_path and os.path.exists(out_path):
+            os.unlink(out_path)
+
 def pipeline(job_id, content, filename, document_id, notebook_id, callback_url):
     try:
         jobs[job_id]["status"] = "processing"
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
         transcript_data = None
         if ext in AUDIO_EXTENSIONS:
+            jobs[job_id]["step"] = "preparing audio"
+            content, filename = prepare_audio(content, filename)
             jobs[job_id]["step"] = "transcribing"
             text, transcript_data = transcribe(content, filename)
         else:
