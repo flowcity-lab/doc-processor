@@ -23,7 +23,7 @@ CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
 
 # === Audio Transcription Config ===
-TRANSCRIPTION_PROVIDER = os.environ.get("TRANSCRIPTION_PROVIDER", "assemblyai")  # assemblyai | whisper
+TRANSCRIPTION_PROVIDER = os.environ.get("TRANSCRIPTION_PROVIDER", "assemblyai")  # assemblyai | deepgram | whisper
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY", "")
 ASSEMBLYAI_SPEECH_MODEL = os.environ.get("ASSEMBLYAI_SPEECH_MODEL", "")  # leer = default (universal-3-pro)
 ASSEMBLYAI_SPEAKER_LABELS = os.environ.get("ASSEMBLYAI_SPEAKER_LABELS", "true").lower() == "true"
@@ -33,6 +33,15 @@ ASSEMBLYAI_LANGUAGE = os.environ.get("ASSEMBLYAI_LANGUAGE", "")  # leer = auto-d
 ASSEMBLYAI_PROMPT = os.environ.get("ASSEMBLYAI_PROMPT", "")  # freier Steuerungs-Prompt für das Modell
 ASSEMBLYAI_KEYTERMS = os.environ.get("ASSEMBLYAI_KEYTERMS", "")  # kommagetrennte Fachbegriffe/Eigennamen
 ASSEMBLYAI_TEMPERATURE = float(os.environ.get("ASSEMBLYAI_TEMPERATURE", "0"))  # 0 = deterministisch
+
+# === Deepgram Config ===
+DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
+DEEPGRAM_MODEL = os.environ.get("DEEPGRAM_MODEL", "nova-3")  # nova-3 | nova-2 | whisper
+DEEPGRAM_LANGUAGE = os.environ.get("DEEPGRAM_LANGUAGE", "")  # leer = auto-detect, z.B. "de"
+DEEPGRAM_DIARIZE = os.environ.get("DEEPGRAM_DIARIZE", "true").lower() == "true"
+DEEPGRAM_PUNCTUATE = os.environ.get("DEEPGRAM_PUNCTUATE", "true").lower() == "true"
+DEEPGRAM_SMART_FORMAT = os.environ.get("DEEPGRAM_SMART_FORMAT", "true").lower() == "true"
+DEEPGRAM_KEYTERMS = os.environ.get("DEEPGRAM_KEYTERMS", "")  # kommagetrennte Fachbegriffe/Eigennamen
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dps")
@@ -463,7 +472,9 @@ def extract(content):
 
 def transcribe(content, filename):
     """Transkribiert Audio – gibt (text, transcript_data) zurück."""
-    if TRANSCRIPTION_PROVIDER == "assemblyai":
+    if TRANSCRIPTION_PROVIDER == "deepgram":
+        return transcribe_deepgram(content, filename)
+    elif TRANSCRIPTION_PROVIDER == "assemblyai":
         return transcribe_assemblyai(content, filename)
     else:
         return transcribe_whisper(content, filename)
@@ -484,6 +495,111 @@ def transcribe_whisper(content, filename):
         "provider_job_id": None,
     }
     return result.text, transcript_data
+
+def transcribe_deepgram(content, filename):
+    """Deepgram Nova-3: Pre-recorded Audio mit Diarization."""
+    import mimetypes
+    mime_type, _ = mimetypes.guess_type(filename)
+    if not mime_type:
+        mime_type = "audio/mpeg"
+
+    base_url = "https://api.deepgram.com/v1/listen"
+    headers = {
+        "Authorization": f"Token {DEEPGRAM_API_KEY}",
+        "Content-Type": mime_type,
+    }
+
+    # Query-Parameter aufbauen
+    params = {
+        "model": DEEPGRAM_MODEL,
+        "punctuate": str(DEEPGRAM_PUNCTUATE).lower(),
+        "diarize": str(DEEPGRAM_DIARIZE).lower(),
+        "smart_format": str(DEEPGRAM_SMART_FORMAT).lower(),
+        "utterances": "true",
+    }
+    if DEEPGRAM_LANGUAGE:
+        params["language"] = DEEPGRAM_LANGUAGE
+    else:
+        params["detect_language"] = "true"
+    if DEEPGRAM_KEYTERMS:
+        # Deepgram: keywords werden als wiederholte Query-Parameter übergeben
+        # httpx unterstützt das über eine Liste von Tuples
+        keywords = [k.strip() for k in DEEPGRAM_KEYTERMS.split(",") if k.strip()]
+    else:
+        keywords = []
+
+    log.info("Deepgram: transcribing %s (%d bytes), model=%s, lang=%s",
+             filename, len(content), DEEPGRAM_MODEL, DEEPGRAM_LANGUAGE or "auto")
+
+    # Für keywords müssen wir die URL manuell bauen (wiederholte params)
+    query_parts = [f"{k}={v}" for k, v in params.items()]
+    for kw in keywords:
+        query_parts.append(f"keywords={kw}")
+    url = f"{base_url}?{'&'.join(query_parts)}"
+
+    resp = httpx.post(url, headers=headers, content=content, timeout=300)
+    if resp.status_code != 200:
+        log.error("Deepgram: request failed: %s %s", resp.status_code, resp.text)
+        resp.raise_for_status()
+
+    data = resp.json()
+
+    # Volltext aus channels
+    full_text = ""
+    channels = data.get("results", {}).get("channels", [])
+    if channels:
+        alts = channels[0].get("alternatives", [])
+        if alts:
+            full_text = alts[0].get("transcript", "")
+
+    # Utterances mit Speaker-Info
+    utterances_raw = data.get("results", {}).get("utterances", [])
+    speakers = set()
+    utterances = []
+    for u in utterances_raw:
+        speaker = str(u.get("speaker", 0))
+        speakers.add(speaker)
+        utterances.append({
+            "speaker": speaker,
+            "text": u.get("transcript", ""),
+            "start": int(u.get("start", 0) * 1000),  # Sekunden → ms
+            "end": int(u.get("end", 0) * 1000),
+        })
+
+    # Metadata
+    metadata = data.get("metadata", {})
+    duration_s = metadata.get("duration", 0)
+    duration_ms = int(duration_s * 1000) if duration_s else 0
+    request_id = metadata.get("request_id", "")
+
+    # Sprache aus detected_language (wenn auto-detect)
+    language = None
+    if channels:
+        alts = channels[0].get("alternatives", [])
+        if alts:
+            lang_list = alts[0].get("languages", [])
+            if lang_list:
+                language = lang_list[0]
+    if not language and DEEPGRAM_LANGUAGE:
+        language = DEEPGRAM_LANGUAGE
+
+    speakers_map = {s: f"Sprecher {int(s)+1}" for s in sorted(speakers)}
+
+    transcript_data = {
+        "full_text": full_text,
+        "utterances": utterances,
+        "speakers_map": speakers_map,
+        "language": language,
+        "duration_ms": duration_ms,
+        "speakers_count": len(speakers),
+        "provider": "deepgram",
+        "provider_job_id": request_id,
+    }
+
+    log.info("Deepgram: done. %d utterances, %d speakers, lang=%s",
+             len(utterances), len(speakers), language)
+
+    return full_text, transcript_data
 
 def transcribe_assemblyai(content, filename):
     """AssemblyAI: Upload → Transcribe → Poll → Return mit Diarization."""
