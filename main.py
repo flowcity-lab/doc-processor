@@ -8,19 +8,71 @@ from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Back
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct, Filter, FieldCondition,
-    MatchValue, MatchAny, FilterSelector
+    MatchValue, MatchAny, FilterSelector, TextIndexParams, TokenizerType,
+    PayloadSchemaType
 )
+from sentence_transformers import CrossEncoder
 
 API_SECRET = os.environ.get("API_SECRET", "")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 QDRANT_HOST = os.environ.get("QDRANT_HOST", "http://qdrant:6333")
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY", "")
 TIKA_HOST = os.environ.get("TIKA_HOST", "http://tika:9998")
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+
+# === AI Provider Switch ===
+# AI_PROVIDER=openai  → OpenAI direkt (Dev/Test, 1 API Key)
+# AI_PROVIDER=azure   → Azure OpenAI (Produktion, DSGVO-konform)
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "openai")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+# Azure OpenAI (nur wenn AI_PROVIDER=azure)
+AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+AZURE_OPENAI_EMBEDDING_ENDPOINT = os.environ.get("AZURE_OPENAI_EMBEDDING_ENDPOINT", "")
+AZURE_OPENAI_EMBEDDING_API_KEY = os.environ.get("AZURE_OPENAI_EMBEDDING_API_KEY", "")
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT = os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-small")
+AZURE_OPENAI_CHAT_ENDPOINT = os.environ.get("AZURE_OPENAI_CHAT_ENDPOINT", "")
+AZURE_OPENAI_CHAT_API_KEY = os.environ.get("AZURE_OPENAI_CHAT_API_KEY", "")
+AZURE_OPENAI_CHAT_DEPLOYMENT = os.environ.get("AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4o")
+
+
+def get_openai_client():
+    """Erstellt OpenAI-Client basierend auf AI_PROVIDER Umgebungsvariable."""
+    if AI_PROVIDER == "azure":
+        from openai import AzureOpenAI
+        # Für Embeddings den Embedding-Endpoint nutzen, für Chat den Chat-Endpoint.
+        # Da wir einen globalen Client brauchen, nehmen wir den Embedding-Endpoint
+        # (Hauptaufgabe des doc-processors). Für Chat-Calls wird ggf. ein separater Client erstellt.
+        return AzureOpenAI(
+            azure_endpoint=AZURE_OPENAI_EMBEDDING_ENDPOINT,
+            api_key=AZURE_OPENAI_EMBEDDING_API_KEY,
+            api_version=AZURE_OPENAI_API_VERSION,
+        )
+    else:
+        return openai.OpenAI(api_key=OPENAI_API_KEY)
+
+
+def get_chat_client():
+    """Erstellt OpenAI-Client für Chat-Completions (z.B. Research-Zusammenfassung)."""
+    if AI_PROVIDER == "azure":
+        from openai import AzureOpenAI
+        return AzureOpenAI(
+            azure_endpoint=AZURE_OPENAI_CHAT_ENDPOINT,
+            api_key=AZURE_OPENAI_CHAT_API_KEY,
+            api_version=AZURE_OPENAI_API_VERSION,
+        )
+    else:
+        return openai.OpenAI(api_key=OPENAI_API_KEY)
 COLLECTION = "notebook_documents"
 VECTOR_DIM = 1536
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
+
+# === Phase 7: RAG Enhancement Config ===
+CONTEXTUAL_RETRIEVAL = os.environ.get("CONTEXTUAL_RETRIEVAL", "true").lower() == "true"
+CROSS_ENCODER_MODEL = os.environ.get("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+HYBRID_SEARCH_ENABLED = os.environ.get("HYBRID_SEARCH_ENABLED", "true").lower() == "true"
+RERANK_TOP_K = int(os.environ.get("RERANK_TOP_K", "20"))  # Anzahl Kandidaten vor Re-Ranking
+cross_encoder = None  # wird in lifespan initialisiert
 
 # === Audio Transcription Config ===
 TRANSCRIPTION_PROVIDER = os.environ.get("TRANSCRIPTION_PROVIDER", "assemblyai")  # assemblyai | deepgram | whisper
@@ -70,9 +122,19 @@ AUDIO_EXTENSIONS = ("mp3", "wav", "m4a", "ogg", "webm")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global qdrant, oai
+    global qdrant, oai, cross_encoder
     qdrant = QdrantClient(url=QDRANT_HOST, api_key=QDRANT_API_KEY, timeout=60)
-    oai = openai.OpenAI(api_key=OPENAI_API_KEY)
+    oai = get_openai_client()
+    log.info("AI Provider: %s", AI_PROVIDER)
+
+    # Cross-Encoder für Re-Ranking laden
+    try:
+        cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
+        log.info("Cross-Encoder geladen: %s", CROSS_ENCODER_MODEL)
+    except Exception as e:
+        log.warning("Cross-Encoder konnte nicht geladen werden: %s — Re-Ranking deaktiviert", str(e))
+        cross_encoder = None
+
     if not qdrant.collection_exists(COLLECTION):
         qdrant.create_collection(
             collection_name=COLLECTION,
@@ -80,7 +142,26 @@ async def lifespan(app: FastAPI):
         )
         qdrant.create_payload_index(COLLECTION, "notebook_id", "keyword")
         qdrant.create_payload_index(COLLECTION, "document_id", "keyword")
-    log.info("DPS ready. Qdrant=%s Tika=%s", QDRANT_HOST, TIKA_HOST)
+
+    # Text-Index für Hybrid Search (BM25-artig) erstellen falls noch nicht vorhanden
+    try:
+        qdrant.create_payload_index(
+            collection_name=COLLECTION,
+            field_name="text",
+            field_schema=TextIndexParams(
+                type="text",
+                tokenizer=TokenizerType.MULTILINGUAL,
+                min_token_len=2,
+                max_token_len=20,
+                lowercase=True,
+            )
+        )
+        log.info("Text-Index für Hybrid Search erstellt")
+    except Exception:
+        log.info("Text-Index existiert bereits oder konnte nicht erstellt werden")
+
+    log.info("DPS ready. Qdrant=%s Tika=%s Hybrid=%s Contextual=%s",
+             QDRANT_HOST, TIKA_HOST, HYBRID_SEARCH_ENABLED, CONTEXTUAL_RETRIEVAL)
 
     # Periodischer Cleanup-Task für alte Jobs
     async def periodic_cleanup():
@@ -177,22 +258,97 @@ async def search(
     authorization: str = Header(None)
 ):
     auth(authorization)
-    resp = oai.embeddings.create(model=EMBEDDING_MODEL, input=query)
+    embed_model = AZURE_OPENAI_EMBEDDING_DEPLOYMENT if AI_PROVIDER == "azure" else EMBEDDING_MODEL
+    resp = oai.embeddings.create(model=embed_model, input=query)
     qvec = resp.data[0].embedding
     must = [FieldCondition(key="notebook_id", match=MatchValue(value=notebook_id))]
     if document_ids:
         ids = [d.strip() for d in document_ids.split(",") if d.strip()]
         if ids:
             must.append(FieldCondition(key="document_id", match=MatchAny(any=ids)))
-    results = qdrant.query_points(
+
+    # Phase 7: Hybrid Search — mehr Kandidaten holen für Re-Ranking
+    fetch_k = RERANK_TOP_K if cross_encoder else top_k
+
+    # 1. Vektor-Suche (Semantic)
+    vector_results = qdrant.query_points(
         collection_name=COLLECTION, query=qvec,
-        query_filter=Filter(must=must), limit=top_k, with_payload=True
+        query_filter=Filter(must=must), limit=fetch_k, with_payload=True
     )
+
+    # 2. Text-Suche (BM25-artig) via Qdrant Full-Text Index
+    text_results_points = []
+    if HYBRID_SEARCH_ENABLED:
+        try:
+            from qdrant_client.models import MatchText
+            text_filter = Filter(must=[
+                *must,
+                FieldCondition(key="text", match=MatchText(text=query))
+            ])
+            text_results = qdrant.scroll(
+                collection_name=COLLECTION,
+                scroll_filter=text_filter,
+                limit=fetch_k,
+                with_payload=True,
+                with_vectors=False,
+            )
+            text_results_points = text_results[0] if text_results else []
+        except Exception as e:
+            log.warning("Text-Suche fehlgeschlagen: %s", str(e))
+
+    # 3. Ergebnisse mergen (Reciprocal Rank Fusion)
+    scored = {}  # point_id -> {payload, rrf_score}
+    # Vector-Ergebnisse
+    for rank, r in enumerate(vector_results.points):
+        pid = str(r.id)
+        scored[pid] = {
+            "payload": r.payload,
+            "rrf_score": 1.0 / (60 + rank),  # RRF mit k=60
+            "vector_score": r.score,
+        }
+    # Text-Ergebnisse dazumischen
+    for rank, r in enumerate(text_results_points):
+        pid = str(r.id)
+        rrf_add = 1.0 / (60 + rank)
+        if pid in scored:
+            scored[pid]["rrf_score"] += rrf_add
+        else:
+            scored[pid] = {
+                "payload": r.payload,
+                "rrf_score": rrf_add,
+                "vector_score": 0.0,
+            }
+
+    # Nach RRF-Score sortieren
+    candidates = sorted(scored.values(), key=lambda x: x["rrf_score"], reverse=True)[:fetch_k]
+
+    # 4. Re-Ranking mit Cross-Encoder
+    if cross_encoder and len(candidates) > 0:
+        pairs = [(query, c["payload"].get("original_text", c["payload"].get("text", ""))) for c in candidates]
+        try:
+            ce_scores = cross_encoder.predict(pairs)
+            for i, score in enumerate(ce_scores):
+                candidates[i]["final_score"] = float(score)
+            candidates.sort(key=lambda x: x["final_score"], reverse=True)
+        except Exception as e:
+            log.warning("Re-Ranking fehlgeschlagen: %s", str(e))
+            for c in candidates:
+                c["final_score"] = c["rrf_score"]
+    else:
+        for c in candidates:
+            c["final_score"] = c.get("vector_score", c["rrf_score"])
+
+    # Top-K zurückgeben
+    final = candidates[:top_k]
     return {"results": [
-        {"text": r.payload.get("text",""), "document_id": r.payload.get("document_id",""),
-         "chunk_index": r.payload.get("chunk_index",0), "filename": r.payload.get("filename",""),
-         "score": r.score}
-        for r in results.points
+        {
+            "text": c["payload"].get("original_text", c["payload"].get("text", "")),
+            "document_id": c["payload"].get("document_id", ""),
+            "chunk_index": c["payload"].get("chunk_index", 0),
+            "filename": c["payload"].get("filename", ""),
+            "score": c["final_score"],
+        }
+        for c in final
     ]}
 
 @app.delete("/documents/{document_id}")
@@ -274,8 +430,16 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url):
         jobs[job_id]["step"] = "chunking"
         chunks = chunk_text(text)
         log.info("Job %s: %d chunks", job_id, len(chunks))
+
+        # Phase 7: Contextual Retrieval — Chunks mit KI-Kontext anreichern
+        if CONTEXTUAL_RETRIEVAL:
+            jobs[job_id]["step"] = "contextualizing"
+            chunks = contextualize_chunks(chunks, text, job_id)
+
         jobs[job_id]["step"] = "embedding"
-        embeddings = embed([c["text"] for c in chunks])
+        # Embedding auf kontextualisiertem Text (falls vorhanden)
+        embed_texts = [c.get("contextualized_text", c["text"]) for c in chunks]
+        embeddings = embed(embed_texts)
         qdrant.delete(
             collection_name=COLLECTION,
             points_selector=FilterSelector(
@@ -285,10 +449,13 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url):
         jobs[job_id]["step"] = "storing"
         points = [
             PointStruct(id=str(uuid.uuid4()), vector=emb, payload={
-                "text": ch["text"], "notebook_id": notebook_id,
+                "text": c.get("contextualized_text", c["text"]),
+                "original_text": c["text"],
+                "context": c.get("context", ""),
+                "notebook_id": notebook_id,
                 "document_id": document_id, "filename": filename, "chunk_index": i
             })
-            for i, (ch, emb) in enumerate(zip(chunks, embeddings))
+            for i, (c, emb) in enumerate(zip(chunks, embeddings))
         ]
         for i in range(0, len(points), 100):
             qdrant.upsert(collection_name=COLLECTION, points=points[i:i+100])
@@ -481,8 +648,14 @@ def url_pipeline(job_id, url, document_id, notebook_id, callback_url):
         chunks = chunk_text(combined_text)
         log.info("Job %s: %d chunks", job_id, len(chunks))
 
+        # Phase 7: Contextual Retrieval
+        if CONTEXTUAL_RETRIEVAL:
+            jobs[job_id]["step"] = "contextualizing"
+            chunks = contextualize_chunks(chunks, combined_text, job_id)
+
         jobs[job_id]["step"] = "embedding"
-        embeddings = embed([c["text"] for c in chunks])
+        embed_texts = [c.get("contextualized_text", c["text"]) for c in chunks]
+        embeddings = embed(embed_texts)
 
         qdrant.delete(
             collection_name=COLLECTION,
@@ -494,10 +667,13 @@ def url_pipeline(job_id, url, document_id, notebook_id, callback_url):
         jobs[job_id]["step"] = "storing"
         points = [
             PointStruct(id=str(uuid.uuid4()), vector=emb, payload={
-                "text": ch["text"], "notebook_id": notebook_id,
+                "text": c.get("contextualized_text", c["text"]),
+                "original_text": c["text"],
+                "context": c.get("context", ""),
+                "notebook_id": notebook_id,
                 "document_id": document_id, "filename": url, "chunk_index": i
             })
-            for i, (ch, emb) in enumerate(zip(chunks, embeddings))
+            for i, (c, emb) in enumerate(zip(chunks, embeddings))
         ]
         for i in range(0, len(points), 100):
             qdrant.upsert(collection_name=COLLECTION, points=points[i:i + 100])
@@ -794,12 +970,71 @@ def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     return chunks
 
 def embed(texts):
+    embed_model = AZURE_OPENAI_EMBEDDING_DEPLOYMENT if AI_PROVIDER == "azure" else EMBEDDING_MODEL
     all_emb = []
     for i in range(0, len(texts), 100):
         batch = texts[i:i+100]
-        resp = oai.embeddings.create(model=EMBEDDING_MODEL, input=batch)
+        resp = oai.embeddings.create(model=embed_model, input=batch)
         all_emb.extend([d.embedding for d in resp.data])
     return all_emb
+
+
+# === Phase 7: Contextual Retrieval ===
+
+CONTEXT_PROMPT = """Hier ist ein Dokument:
+<document>
+{doc_summary}
+</document>
+
+Hier ist ein Chunk aus diesem Dokument:
+<chunk>
+{chunk_text}
+</chunk>
+
+Gib einen kurzen, prägnanten Kontext (2-3 Sätze), der erklärt, wo dieser Chunk im Dokument eingeordnet ist und worum es darin geht. Der Kontext soll helfen, den Chunk bei einer Suchanfrage besser zu finden. Antworte NUR mit dem Kontext, ohne Einleitung."""
+
+
+def contextualize_chunks(chunks, full_text, job_id=""):
+    """Reichert jeden Chunk mit KI-generiertem Kontext an (Contextual Retrieval).
+    Gibt Chunks mit 'context' und 'contextualized_text' Feldern zurück.
+    """
+    if not CONTEXTUAL_RETRIEVAL or not chunks:
+        return chunks
+
+    # Dokument-Zusammenfassung erstellen (max 2000 Zeichen für den Prompt)
+    doc_summary = full_text[:2000]
+    if len(full_text) > 2000:
+        doc_summary += "..."
+
+    chat_client = get_chat_client()
+    chat_model = AZURE_OPENAI_CHAT_DEPLOYMENT if AI_PROVIDER == "azure" else "gpt-4.1-mini"
+
+    for i, chunk in enumerate(chunks):
+        try:
+            response = chat_client.chat.completions.create(
+                model=chat_model,
+                messages=[{
+                    "role": "user",
+                    "content": CONTEXT_PROMPT.format(
+                        doc_summary=doc_summary,
+                        chunk_text=chunk["text"]
+                    )
+                }],
+                temperature=0.0,
+                max_tokens=150,
+            )
+            context = response.choices[0].message.content.strip()
+            chunk["context"] = context
+            chunk["contextualized_text"] = f"{context}\n\n{chunk['text']}"
+        except Exception as e:
+            log.warning("Job %s: Kontext für Chunk %d fehlgeschlagen: %s", job_id, i, str(e))
+            chunk["context"] = ""
+            chunk["contextualized_text"] = chunk["text"]
+
+    log.info("Job %s: %d/%d Chunks kontextualisiert", job_id,
+             sum(1 for c in chunks if c.get("context")), len(chunks))
+    return chunks
+
 
 def notify(url, job_id, document_id, status, chunks, error="", transcript_data=None):
     try:
@@ -905,8 +1140,10 @@ def research_pipeline(job_id, url, callback_url):
         # Text auf max. 80000 Zeichen begrenzen für API
         input_text = combined_text[:80000]
 
-        response = oai.chat.completions.create(
-            model="gpt-4.1-mini",
+        chat_client = get_chat_client()
+        chat_model = AZURE_OPENAI_CHAT_DEPLOYMENT if AI_PROVIDER == "azure" else "gpt-4.1-mini"
+        response = chat_client.chat.completions.create(
+            model=chat_model,
             messages=[
                 {"role": "system", "content": RESEARCH_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Erstelle ein umfangreiches Wissensdokument basierend auf folgendem Website-Inhalt:\n\n{input_text}"}

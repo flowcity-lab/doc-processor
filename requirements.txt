@@ -5,4 +5,5 @@ httpx
 openai
 qdrant-client
 trafilatura
+sentence-transformers
 
