@@ -13,7 +13,8 @@ from qdrant_client.models import (
 )
 from sentence_transformers import CrossEncoder
 
-API_SECRET = os.environ.get("API_SECRET", "")
+# Einheitlich mit Laravel: DOC_PROCESSOR_SECRET (Fallback auf API_SECRET für Abwärtskompatibilität)
+DOC_PROCESSOR_SECRET = os.environ.get("DOC_PROCESSOR_SECRET", os.environ.get("API_SECRET", ""))
 QDRANT_HOST = os.environ.get("QDRANT_HOST", "http://qdrant:6333")
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY", "")
 TIKA_HOST = os.environ.get("TIKA_HOST", "http://tika:9998")
@@ -176,7 +177,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Document Processing Service", lifespan=lifespan)
 
 def auth(authorization: str = Header(None)):
-    if not authorization or authorization != f"Bearer {API_SECRET}":
+    if not authorization or authorization != f"Bearer {DOC_PROCESSOR_SECRET}":
         raise HTTPException(401, "Unauthorized")
 
 @app.get("/health")
@@ -1046,7 +1047,7 @@ def notify(url, job_id, document_id, status, chunks, error="", transcript_data=N
             payload["transcript"] = transcript_data
         with httpx.Client(timeout=30) as c:
             c.post(url, json=payload,
-                headers={"Authorization": f"Bearer {API_SECRET}"})
+                headers={"Authorization": f"Bearer {DOC_PROCESSOR_SECRET}"})
     except Exception as e:
         log.error("Callback failed: %s", str(e))
 
@@ -1177,7 +1178,7 @@ def notify_research(url, job_id, status, result_text="", error=""):
                 "status": status,
                 "result_text": result_text,
                 "error": error,
-            }, headers={"Authorization": f"Bearer {API_SECRET}"})
+            }, headers={"Authorization": f"Bearer {DOC_PROCESSOR_SECRET}"})
     except Exception as e:
         log.error("Research callback failed: %s", str(e))
 
