@@ -1,4 +1,4 @@
-import os, uuid, time, io, logging, re, asyncio, subprocess, tempfile
+import os, uuid, time, io, logging, re, asyncio, subprocess, tempfile, json
 from contextlib import asynccontextmanager
 from typing import Optional
 from urllib.parse import urlparse, urljoin
@@ -36,6 +36,9 @@ GOOGLE_REGION = os.environ.get("GOOGLE_REGION", "us-central1")
 
 # Chat-Modell für Contextual Retrieval & Research
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4.1-mini")
+
+# Dual-Audio-Embedding: Audiodateien zusätzlich direkt via Gemini embedden (benötigt Google)
+DUAL_AUDIO_EMBEDDING = os.environ.get("DUAL_AUDIO_EMBEDDING", "false").lower() == "true"
 
 
 def get_openai_client():
@@ -172,6 +175,18 @@ async def lifespan(app: FastAPI):
         qdrant.create_payload_index(COLLECTION, "notebook_id", "keyword")
         qdrant.create_payload_index(COLLECTION, "document_id", "keyword")
 
+    # Audio-Collection für Dual-Embedding (separate Flat-Vector Collection)
+    if DUAL_AUDIO_EMBEDDING and EMBEDDING_PROVIDER == "google":
+        audio_col = COLLECTION + "_audio"
+        if not qdrant.collection_exists(audio_col):
+            qdrant.create_collection(
+                collection_name=audio_col,
+                vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE)
+            )
+            qdrant.create_payload_index(audio_col, "document_id", "keyword")
+            qdrant.create_payload_index(audio_col, "notebook_id", "keyword")
+            log.info("Audio-Collection %s erstellt (Dual Embedding)", audio_col)
+
     # Text-Index für Hybrid Search (BM25-artig) erstellen falls noch nicht vorhanden
     try:
         qdrant.create_payload_index(
@@ -234,18 +249,27 @@ async def process_doc(
     document_id: str = Form(...),
     notebook_id: str = Form(...),
     callback_url: str = Form(""),
+    pdf_mode: str = Form("basic"),
+    existing_transcript: str = Form(""),
     authorization: str = Header(None)
 ):
     auth(authorization)
     job_id = str(uuid.uuid4())
     content = await file.read()
+    # existing_transcript ist JSON-kodierter String (oder leer)
+    parsed_transcript = None
+    if existing_transcript:
+        try:
+            parsed_transcript = json.loads(existing_transcript)
+        except Exception:
+            parsed_transcript = None
     jobs[job_id] = {
         "job_id": job_id, "status": "queued", "step": "",
         "document_id": document_id, "notebook_id": notebook_id,
         "filename": file.filename, "chunks": 0, "error": None,
-        "started_at": time.time()
+        "pdf_mode": pdf_mode, "started_at": time.time()
     }
-    bg.add_task(pipeline, job_id, content, file.filename or "", document_id, notebook_id, callback_url)
+    bg.add_task(pipeline, job_id, content, file.filename or "", document_id, notebook_id, callback_url, pdf_mode, parsed_transcript)
     return {"job_id": job_id, "status": "queued"}
 
 @app.post("/process-url")
@@ -255,6 +279,7 @@ async def process_url(
     document_id: str = Form(...),
     notebook_id: str = Form(...),
     callback_url: str = Form(""),
+    pdf_mode: str = Form("basic"),
     authorization: str = Header(None)
 ):
     auth(authorization)
@@ -263,9 +288,9 @@ async def process_url(
         "job_id": job_id, "status": "queued", "step": "",
         "document_id": document_id, "notebook_id": notebook_id,
         "filename": url, "chunks": 0, "error": None,
-        "started_at": time.time()
+        "pdf_mode": pdf_mode, "started_at": time.time()
     }
-    bg.add_task(url_pipeline, job_id, url, document_id, notebook_id, callback_url)
+    bg.add_task(url_pipeline, job_id, url, document_id, notebook_id, callback_url, pdf_mode)
     return {"job_id": job_id, "status": "queued"}
 
 @app.post("/research-url")
@@ -338,14 +363,38 @@ async def search(
         except Exception as e:
             log.warning("Text-Suche fehlgeschlagen: %s", str(e))
 
+    # 2b. Audio-Vektor-Suche (Dual Embedding) — sucht im Audio-Chunk auf Dokument-Ebene
+    audio_doc_ids = set()
+    if DUAL_AUDIO_EMBEDDING and EMBEDDING_PROVIDER == "google":
+        try:
+            audio_col = COLLECTION + "_audio"
+            if qdrant.collection_exists(audio_col):
+                audio_must = [FieldCondition(key="notebook_id", match=MatchValue(value=notebook_id))]
+                if document_ids:
+                    ids = [d.strip() for d in document_ids.split(",") if d.strip()]
+                    if ids:
+                        audio_must.append(FieldCondition(key="document_id", match=MatchAny(any=ids)))
+                audio_hits = qdrant.query_points(
+                    collection_name=audio_col, query=qvec,
+                    query_filter=Filter(must=audio_must), limit=top_k, with_payload=True
+                )
+                # document_ids aus Audio-Treffern sammeln → Text-Chunks dieser Dokumente bevorzugen
+                audio_doc_ids = {r.payload.get("document_id") for r in audio_hits.points if r.score > 0.7}
+                if audio_doc_ids:
+                    log.info("Dual-Audio: %d Dokumente via Audio-Vektor gefunden", len(audio_doc_ids))
+        except Exception as e:
+            log.warning("Audio-Suche fehlgeschlagen: %s", e)
+
     # 3. Ergebnisse mergen (Reciprocal Rank Fusion)
     scored = {}  # point_id -> {payload, rrf_score}
     # Vector-Ergebnisse
     for rank, r in enumerate(vector_results.points):
         pid = str(r.id)
+        # Audio-Dokumente erhalten Bonus-Score
+        audio_bonus = 0.3 if r.payload.get("document_id") in audio_doc_ids else 0.0
         scored[pid] = {
             "payload": r.payload,
-            "rrf_score": 1.0 / (60 + rank),  # RRF mit k=60
+            "rrf_score": 1.0 / (60 + rank) + audio_bonus,
             "vector_score": r.score,
         }
     # Text-Ergebnisse dazumischen
@@ -453,19 +502,77 @@ def prepare_audio(content, filename):
         if out_path and os.path.exists(out_path):
             os.unlink(out_path)
 
-def pipeline(job_id, content, filename, document_id, notebook_id, callback_url):
+def pipeline(job_id, content, filename, document_id, notebook_id, callback_url, pdf_mode="basic", existing_transcript=None):
+    """
+    pdf_mode:
+        'basic'              – nur Text via Tika (Standard)
+        'vision_description' – Bilder via Vision-LLM beschreiben (TODO: A6)
+        'multimodal'         – Seiten direkt via Gemini Embedding 2 embedden (TODO: A7)
+    existing_transcript: vorhandenes Transkript-Dict (spart Re-Transkription beim Reindex)
+    """
     try:
         jobs[job_id]["status"] = "processing"
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
         transcript_data = None
         if ext in AUDIO_EXTENSIONS:
-            jobs[job_id]["step"] = "preparing audio"
-            content, filename = prepare_audio(content, filename)
-            jobs[job_id]["step"] = "transcribing"
-            text, transcript_data = transcribe(content, filename)
+            if existing_transcript and existing_transcript.get("full_text"):
+                # Vorhandenes Transkript wiederverwenden – keine erneute Transkription
+                log.info("Job %s: Vorhandenes Transkript wird wiederverwendet (kein API-Call)", job_id)
+                text = existing_transcript["full_text"]
+                transcript_data = existing_transcript
+            else:
+                jobs[job_id]["step"] = "preparing audio"
+                content, filename = prepare_audio(content, filename)
+                jobs[job_id]["step"] = "transcribing"
+                text, transcript_data = transcribe(content, filename)
         else:
             jobs[job_id]["step"] = "extracting"
-            text = extract(content)
+            ext_lower = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+            if ext_lower == "pdf" and pdf_mode == "multimodal":
+                # A7/A8: Jede Seite direkt embedden (Bild → Gemini Embedding 2)
+                jobs[job_id]["step"] = "extracting (multimodal)"
+                multimodal_pages = extract_pdf_multimodal(content, job_id)
+                if multimodal_pages:
+                    # Direkt als Qdrant-Punkte speichern, Pipeline überspringen
+                    qdrant.delete(
+                        collection_name=COLLECTION,
+                        points_selector=FilterSelector(
+                            filter=Filter(must=[FieldCondition(key="document_id", match=MatchValue(value=document_id))])
+                        )
+                    )
+                    mm_points = [
+                        PointStruct(id=str(uuid.uuid4()), vector=p["vector"], payload={
+                            "text":        p["text"],
+                            "original_text": p["text"],
+                            "context":     "",
+                            "notebook_id": notebook_id,
+                            "document_id": document_id,
+                            "filename":    filename,
+                            "chunk_index": p["page_num"] - 1,
+                            "has_image":   True,
+                            "image_b64":   p["image_b64"],
+                            "page_num":    p["page_num"],
+                        })
+                        for p in multimodal_pages
+                    ]
+                    for i in range(0, len(mm_points), 50):
+                        qdrant.upsert(collection_name=COLLECTION, points=mm_points[i:i+50])
+                    jobs[job_id]["status"] = "ready"
+                    jobs[job_id]["step"]   = "done"
+                    jobs[job_id]["chunks"] = len(mm_points)
+                    if callback_url:
+                        notify(callback_url, job_id, document_id, "ready", len(mm_points),
+                               usage=jobs[job_id].get("usage"))
+                    return  # Pipeline endet hier für multimodal PDFs
+                else:
+                    # Fallback: Tika
+                    log.warning("Job %s: multimodal fehlgeschlagen, Fallback auf Tika", job_id)
+                    text = extract(content)
+            elif ext_lower == "pdf" and pdf_mode == "vision_description":
+                jobs[job_id]["step"] = "extracting (vision)"
+                text = extract_pdf_with_vision(content, job_id)
+            else:
+                text = extract(content)
         if not text or len(text.strip()) < 10:
             raise Exception(f"No text extracted from {filename}")
         log.info("Job %s: %d chars from %s", job_id, len(text), filename)
@@ -481,7 +588,7 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url):
         jobs[job_id]["step"] = "embedding"
         # Embedding auf kontextualisiertem Text (falls vorhanden)
         embed_texts = [c.get("contextualized_text", c["text"]) for c in chunks]
-        embeddings = embed(embed_texts)
+        embeddings = embed(embed_texts, job_id=job_id)
         qdrant.delete(
             collection_name=COLLECTION,
             points_selector=FilterSelector(
@@ -501,6 +608,29 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url):
         ]
         for i in range(0, len(points), 100):
             qdrant.upsert(collection_name=COLLECTION, points=points[i:i+100])
+
+        # Dual-Audio-Embedding: Gesamt-Audio als einen eigenen Vektor in der Audio-Collection
+        if DUAL_AUDIO_EMBEDDING and EMBEDDING_PROVIDER == "google" and ext in AUDIO_EXTENSIONS:
+            jobs[job_id]["step"] = "audio_embedding"
+            audio_vec = _embed_google_audio(content, mime_type="audio/mp3")
+            if audio_vec:
+                audio_col = COLLECTION + "_audio"
+                qdrant.delete(
+                    collection_name=audio_col,
+                    points_selector=FilterSelector(
+                        filter=Filter(must=[FieldCondition(key="document_id", match=MatchValue(value=document_id))])
+                    )
+                )
+                qdrant.upsert(
+                    collection_name=audio_col,
+                    points=[PointStruct(
+                        id=str(uuid.uuid4()),
+                        vector=audio_vec,
+                        payload={"document_id": document_id, "notebook_id": notebook_id, "filename": filename}
+                    )]
+                )
+                log.info("Job %s: Audio-Vektor in %s gespeichert", job_id, audio_col)
+
         jobs[job_id]["status"] = "ready"
         jobs[job_id]["step"] = "done"
         jobs[job_id]["chunks"] = len(chunks)
@@ -508,7 +638,8 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url):
             jobs[job_id]["transcript"] = transcript_data
         log.info("Job %s: done, %d chunks stored", job_id, len(chunks))
         if callback_url:
-            notify(callback_url, job_id, document_id, "ready", len(chunks), transcript_data=transcript_data)
+            notify(callback_url, job_id, document_id, "ready", len(chunks),
+                   transcript_data=transcript_data, usage=jobs[job_id].get("usage"))
     except Exception as e:
         log.error("Job %s failed: %s", job_id, str(e))
         jobs[job_id]["status"] = "failed"
@@ -642,7 +773,7 @@ def discover_links(html, base_url):
     links.discard(base_clean + "/")
     return list(links)[:MAX_CRAWL_PAGES]
 
-def url_pipeline(job_id, url, document_id, notebook_id, callback_url):
+def url_pipeline(job_id, url, document_id, notebook_id, callback_url, pdf_mode="basic"):
     """URL(s) laden, Text extrahieren, chunken, embedden, speichern."""
     try:
         jobs[job_id]["status"] = "processing"
@@ -697,7 +828,7 @@ def url_pipeline(job_id, url, document_id, notebook_id, callback_url):
 
         jobs[job_id]["step"] = "embedding"
         embed_texts = [c.get("contextualized_text", c["text"]) for c in chunks]
-        embeddings = embed(embed_texts)
+        embeddings = embed(embed_texts, job_id=job_id)
 
         qdrant.delete(
             collection_name=COLLECTION,
@@ -725,7 +856,8 @@ def url_pipeline(job_id, url, document_id, notebook_id, callback_url):
         jobs[job_id]["chunks"] = len(chunks)
         log.info("Job %s: done, %d chunks stored from URL", job_id, len(chunks))
         if callback_url:
-            notify(callback_url, job_id, document_id, "ready", len(chunks))
+            notify(callback_url, job_id, document_id, "ready", len(chunks),
+                   usage=jobs[job_id].get("usage"))
     except Exception as e:
         log.error("Job %s failed: %s", job_id, str(e))
         jobs[job_id]["status"] = "failed"
@@ -738,6 +870,156 @@ def extract(content):
         r = c.put(f"{TIKA_HOST}/tika", content=content, headers={"Accept": "text/plain"})
         r.raise_for_status()
         return r.text
+
+
+def extract_pdf_with_vision(content: bytes, job_id: str = "") -> str:
+    """
+    PDF-Seiten via PyMuPDF als Bilder extrahieren und via Vision-LLM beschreiben.
+    pdf_mode='vision_description': Ergebnis sind Textbeschreibungen aller Seiten.
+    Fällt bei Fehler auf Tika-Extraktion zurück.
+    """
+    try:
+        import fitz  # PyMuPDF
+        import base64 as _b64
+
+        doc = fitz.open(stream=content, filetype="pdf")
+        page_texts = []
+
+        for page_num, page in enumerate(doc):
+            # Seite als PNG rendern (150 DPI reicht für Vision)
+            mat = fitz.Matrix(150 / 72, 150 / 72)
+            pix = page.get_pixmap(matrix=mat)
+            img_bytes = pix.tobytes("png")
+            b64_img = _b64.b64encode(img_bytes).decode("utf-8")
+
+            # Text der Seite (aus PDF-Layer) als Kontext
+            page_text = page.get_text().strip()
+
+            try:
+                prompt = (
+                    "Beschreibe den vollständigen Inhalt dieser PDF-Seite auf Deutsch. "
+                    "Extrahiere allen Text, Tabellen, Diagramme und Bilder als strukturierten Text. "
+                    "Ignoriere reine Designelemente ohne Informationsgehalt."
+                )
+                if page_text:
+                    prompt += f"\n\nExtrahierter Text der Seite (zur Kontrolle): {page_text[:500]}"
+
+                response = oai.chat.completions.create(
+                    model=CHAT_MODEL,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}},
+                            {"type": "text", "text": prompt},
+                        ]
+                    }],
+                    max_tokens=1000,
+                )
+                description = response.choices[0].message.content.strip()
+                page_texts.append(f"[Seite {page_num + 1}]\n{description}")
+
+                # Usage tracken
+                if job_id and job_id in jobs:
+                    usage = jobs[job_id].setdefault("usage", {})
+                    usage["vision_calls"]       = usage.get("vision_calls", 0) + 1
+                    usage["context_tokens_in"]  = usage.get("context_tokens_in", 0) + (response.usage.prompt_tokens or 0)
+                    usage["context_tokens_out"] = usage.get("context_tokens_out", 0) + (response.usage.completion_tokens or 0)
+                    usage["context_model"]      = CHAT_MODEL
+
+            except Exception as e:
+                log.warning("Job %s: Vision-Beschreibung Seite %d fehlgeschlagen: %s", job_id, page_num + 1, e)
+                if page_text:
+                    page_texts.append(f"[Seite {page_num + 1}]\n{page_text}")
+
+        doc.close()
+        return "\n\n".join(page_texts) if page_texts else extract(content)
+
+    except ImportError:
+        log.warning("PyMuPDF nicht installiert – Fallback auf Tika")
+        return extract(content)
+    except Exception as e:
+        log.error("PDF Vision-Extraktion fehlgeschlagen: %s – Fallback auf Tika", e)
+        return extract(content)
+
+
+def extract_pdf_multimodal(content: bytes, job_id: str = "") -> list[dict]:
+    """
+    A7/A8: PDF-Seiten als Bild direkt an Gemini Embedding 2 senden.
+    Gibt eine Liste von Dicts zurück: {vector, text, image_b64, page_num}
+    Fällt auf Tika-Text-Embedding zurück wenn Gemini nicht verfügbar.
+    """
+    if EMBEDDING_PROVIDER != "google" or not google_client:
+        log.warning("Multimodal PDF benötigt EMBEDDING_PROVIDER=google – Fallback auf Tika")
+        return []  # leere Liste → pipeline() nutzt dann Tika-Fallback
+
+    try:
+        import fitz
+        import base64 as _b64
+        from google.genai import types
+
+        doc = fitz.open(stream=content, filetype="pdf")
+        results = []
+
+        for page_num, page in enumerate(doc):
+            # Seite als JPEG rendern (100 DPI, komprimiert für Qdrant-Payload)
+            mat = fitz.Matrix(100 / 72, 100 / 72)
+            pix = page.get_pixmap(matrix=mat)
+            img_bytes = pix.tobytes("jpeg")
+            b64_img = _b64.b64encode(img_bytes).decode("utf-8")
+
+            # Seitentext als Fallback-Kontext
+            page_text = page.get_text().strip() or f"[Seite {page_num + 1} – kein Textlayer]"
+
+            # Gemini Embedding 2: Bild direkt embedden
+            try:
+                part = types.Part.from_bytes(
+                    data=_b64.b64decode(b64_img),
+                    mime_type="image/jpeg",
+                )
+                result = google_client.models.embed_content(
+                    model=EMBEDDING_MODEL,
+                    contents=[part],
+                    config=types.EmbedContentConfig(
+                        task_type="RETRIEVAL_DOCUMENT",
+                        output_dimensionality=EMBEDDING_DIMENSIONS,
+                    ),
+                )
+                vec = result.embeddings[0].values
+                if EMBEDDING_DIMENSIONS < 3072:
+                    import numpy as np
+                    v = np.array(vec)
+                    norm = np.linalg.norm(v)
+                    if norm > 0:
+                        vec = (v / norm).tolist()
+
+                results.append({
+                    "vector":    vec,
+                    "text":      page_text,
+                    "image_b64": b64_img,
+                    "page_num":  page_num + 1,
+                })
+
+                # Usage tracken
+                if job_id and job_id in jobs:
+                    usage = jobs[job_id].setdefault("usage", {})
+                    usage["embedding_tokens"] = usage.get("embedding_tokens", 0) + EMBEDDING_DIMENSIONS
+                    usage["embedding_model"]  = EMBEDDING_MODEL
+
+            except Exception as e:
+                log.warning("Multimodal Embedding Seite %d fehlgeschlagen: %s", page_num + 1, e)
+                # Seite ohne Bild-Embedding überspringen
+
+        doc.close()
+        log.info("Job %s: %d Seiten multimodal embedded", job_id, len(results))
+        return results
+
+    except ImportError:
+        log.warning("PyMuPDF nicht installiert – multimodal nicht möglich")
+        return []
+    except Exception as e:
+        log.error("PDF multimodal Extraktion fehlgeschlagen: %s", e)
+        return []
+
 
 def transcribe(content, filename):
     """Transkribiert Audio – gibt (text, transcript_data) zurück."""
@@ -1017,16 +1299,17 @@ def embed_single(text):
     return vecs[0]
 
 
-def embed(texts, task_type="RETRIEVAL_DOCUMENT"):
+def embed(texts, task_type="RETRIEVAL_DOCUMENT", job_id=None):
     """Texte embedden – unterstützt OpenAI und Google Gemini Embedding 2.
     task_type wird nur für Google genutzt (RETRIEVAL_DOCUMENT vs RETRIEVAL_QUERY).
+    job_id: optional, für Usage-Tracking.
     """
     if EMBEDDING_PROVIDER == "google":
         return _embed_google(texts, task_type)
-    return _embed_openai(texts)
+    return _embed_openai(texts, job_id=job_id)
 
 
-def _embed_openai(texts):
+def _embed_openai(texts, job_id=None):
     """OpenAI Embedding (text-embedding-3-small/large)."""
     all_emb = []
     for i in range(0, len(texts), 100):
@@ -1037,6 +1320,11 @@ def _embed_openai(texts):
             dimensions=EMBEDDING_DIMENSIONS,
         )
         all_emb.extend([d.embedding for d in resp.data])
+        # Usage-Tracking: Embedding-Tokens akkumulieren
+        if job_id and job_id in jobs:
+            usage = jobs[job_id].setdefault("usage", {})
+            usage["embedding_tokens"] = usage.get("embedding_tokens", 0) + (resp.usage.total_tokens or 0)
+            usage["embedding_model"]  = EMBEDDING_MODEL
     return all_emb
 
 
@@ -1069,6 +1357,41 @@ def _embed_google(texts, task_type="RETRIEVAL_DOCUMENT"):
                     vec = (vec_np / norm).tolist()
             all_emb.append(vec)
     return all_emb
+
+
+def _embed_google_audio(audio_bytes: bytes, mime_type: str = "audio/mp3") -> list | None:
+    """
+    Audio-Bytes direkt via Gemini Embedding 2 embedden (ohne Transkription).
+    Gibt einen einzelnen Vektor zurück oder None bei Fehler.
+    Nur verfügbar wenn EMBEDDING_PROVIDER=google.
+    """
+    if not google_client or EMBEDDING_PROVIDER != "google":
+        return None
+    try:
+        from google.genai import types
+        import base64 as _b64
+        encoded = _b64.b64encode(audio_bytes).decode("utf-8")
+        part = types.Part.from_bytes(data=encoded, mime_type=mime_type)
+        result = google_client.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=[part],
+            config=types.EmbedContentConfig(
+                task_type="RETRIEVAL_DOCUMENT",
+                output_dimensionality=EMBEDDING_DIMENSIONS,
+            ),
+        )
+        emb = result.embeddings[0]
+        vec = emb.values
+        if EMBEDDING_DIMENSIONS < 3072:
+            import numpy as np
+            v = np.array(vec)
+            norm = np.linalg.norm(v)
+            if norm > 0:
+                vec = (v / norm).tolist()
+        return vec
+    except Exception as e:
+        log.warning("Audio-Embedding via Gemini fehlgeschlagen: %s", e)
+        return None
 
 
 # === Phase 7: Contextual Retrieval ===
@@ -1117,6 +1440,12 @@ def contextualize_chunks(chunks, full_text, job_id=""):
             context = response.choices[0].message.content.strip()
             chunk["context"] = context
             chunk["contextualized_text"] = f"{context}\n\n{chunk['text']}"
+            # Usage-Tracking: Contextual-Retrieval-Tokens akkumulieren
+            if job_id and job_id in jobs:
+                usage = jobs[job_id].setdefault("usage", {})
+                usage["context_tokens_in"]  = usage.get("context_tokens_in", 0)  + (response.usage.prompt_tokens or 0)
+                usage["context_tokens_out"] = usage.get("context_tokens_out", 0) + (response.usage.completion_tokens or 0)
+                usage["context_model"]      = CHAT_MODEL
         except Exception as e:
             log.warning("Job %s: Kontext für Chunk %d fehlgeschlagen: %s", job_id, i, str(e))
             chunk["context"] = ""
@@ -1127,7 +1456,7 @@ def contextualize_chunks(chunks, full_text, job_id=""):
     return chunks
 
 
-def notify(url, job_id, document_id, status, chunks, error="", transcript_data=None):
+def notify(url, job_id, document_id, status, chunks, error="", transcript_data=None, usage=None):
     try:
         payload = {
             "job_id": job_id, "document_id": document_id,
@@ -1135,6 +1464,8 @@ def notify(url, job_id, document_id, status, chunks, error="", transcript_data=N
         }
         if transcript_data:
             payload["transcript"] = transcript_data
+        if usage:
+            payload["usage"] = usage
         with httpx.Client(timeout=30) as c:
             c.post(url, json=payload,
                 headers={"Authorization": f"Bearer {DOC_PROCESSOR_SECRET}"})
