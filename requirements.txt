@@ -6,4 +6,6 @@ openai
 qdrant-client
 trafilatura
 sentence-transformers
+google-genai
+numpy
 

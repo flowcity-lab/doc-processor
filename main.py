@@ -18,53 +18,56 @@ DOC_PROCESSOR_SECRET = os.environ.get("DOC_PROCESSOR_SECRET", os.environ.get("AP
 QDRANT_HOST = os.environ.get("QDRANT_HOST", "http://qdrant:6333")
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY", "")
 TIKA_HOST = os.environ.get("TIKA_HOST", "http://tika:9998")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
 
-# === AI Provider Switch ===
-# AI_PROVIDER=openai  → OpenAI direkt (Dev/Test, 1 API Key)
-# AI_PROVIDER=azure   → Azure OpenAI (Produktion, DSGVO-konform)
-AI_PROVIDER = os.environ.get("AI_PROVIDER", "openai")
+# === Embedding Provider Switch ===
+# EMBEDDING_PROVIDER=openai  → OpenAI text-embedding-3-small/large
+# EMBEDDING_PROVIDER=google  → Google Gemini Embedding 2 (Vertex AI)
+EMBEDDING_PROVIDER = os.environ.get("EMBEDDING_PROVIDER", "openai")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_DIMENSIONS = int(os.environ.get("EMBEDDING_DIMENSIONS", "1536"))
+
+# OpenAI API Key (für Embeddings bei provider=openai UND für Chat/Contextual Retrieval)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
-# Azure OpenAI (nur wenn AI_PROVIDER=azure)
-AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
-AZURE_OPENAI_EMBEDDING_ENDPOINT = os.environ.get("AZURE_OPENAI_EMBEDDING_ENDPOINT", "")
-AZURE_OPENAI_EMBEDDING_API_KEY = os.environ.get("AZURE_OPENAI_EMBEDDING_API_KEY", "")
-AZURE_OPENAI_EMBEDDING_DEPLOYMENT = os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-small")
-AZURE_OPENAI_CHAT_ENDPOINT = os.environ.get("AZURE_OPENAI_CHAT_ENDPOINT", "")
-AZURE_OPENAI_CHAT_API_KEY = os.environ.get("AZURE_OPENAI_CHAT_API_KEY", "")
-AZURE_OPENAI_CHAT_DEPLOYMENT = os.environ.get("AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4o")
+# Google Vertex AI (für Embeddings bei provider=google)
+GOOGLE_CREDENTIALS_BASE64 = os.environ.get("GOOGLE_CREDENTIALS_BASE64", "")
+GOOGLE_PROJECT_ID = os.environ.get("GOOGLE_PROJECT_ID", "")
+GOOGLE_REGION = os.environ.get("GOOGLE_REGION", "us-central1")
+
+# Chat-Modell für Contextual Retrieval & Research
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4.1-mini")
 
 
 def get_openai_client():
-    """Erstellt OpenAI-Client basierend auf AI_PROVIDER Umgebungsvariable."""
-    if AI_PROVIDER == "azure":
-        from openai import AzureOpenAI
-        # Für Embeddings den Embedding-Endpoint nutzen, für Chat den Chat-Endpoint.
-        # Da wir einen globalen Client brauchen, nehmen wir den Embedding-Endpoint
-        # (Hauptaufgabe des doc-processors). Für Chat-Calls wird ggf. ein separater Client erstellt.
-        return AzureOpenAI(
-            azure_endpoint=AZURE_OPENAI_EMBEDDING_ENDPOINT,
-            api_key=AZURE_OPENAI_EMBEDDING_API_KEY,
-            api_version=AZURE_OPENAI_API_VERSION,
-        )
-    else:
-        return openai.OpenAI(api_key=OPENAI_API_KEY)
+    """Erstellt OpenAI-Client für Embeddings (bei provider=openai) und Chat."""
+    return openai.OpenAI(api_key=OPENAI_API_KEY)
 
 
 def get_chat_client():
-    """Erstellt OpenAI-Client für Chat-Completions (z.B. Research-Zusammenfassung)."""
-    if AI_PROVIDER == "azure":
-        from openai import AzureOpenAI
-        return AzureOpenAI(
-            azure_endpoint=AZURE_OPENAI_CHAT_ENDPOINT,
-            api_key=AZURE_OPENAI_CHAT_API_KEY,
-            api_version=AZURE_OPENAI_API_VERSION,
-        )
-    else:
-        return openai.OpenAI(api_key=OPENAI_API_KEY)
+    """Erstellt OpenAI-Client für Chat-Completions (Contextual Retrieval, Research)."""
+    return openai.OpenAI(api_key=OPENAI_API_KEY)
+
+
+def get_google_genai_client():
+    """Erstellt Google GenAI-Client für Gemini Embedding 2 (Vertex AI)."""
+    import base64, json, tempfile as _tf
+    from google import genai
+
+    if GOOGLE_CREDENTIALS_BASE64:
+        creds_json = base64.b64decode(GOOGLE_CREDENTIALS_BASE64).decode("utf-8")
+        creds_file = _tf.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        creds_file.write(creds_json)
+        creds_file.close()
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_file.name
+
+    return genai.Client(
+        vertexai=True,
+        project=GOOGLE_PROJECT_ID,
+        location=GOOGLE_REGION,
+    )
+
 COLLECTION = "notebook_documents"
-VECTOR_DIM = 1536
+VECTOR_DIM = EMBEDDING_DIMENSIONS
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
 
@@ -102,6 +105,7 @@ log = logging.getLogger("dps")
 jobs = {}
 qdrant = None
 oai = None
+google_client = None
 
 # TTL für abgeschlossene Jobs: nach 1 Stunde aus dem Speicher entfernen
 JOB_TTL_SECONDS = 3600
@@ -123,10 +127,20 @@ AUDIO_EXTENSIONS = ("mp3", "wav", "m4a", "ogg", "webm")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global qdrant, oai, cross_encoder
+    global qdrant, oai, google_client, cross_encoder
     qdrant = QdrantClient(url=QDRANT_HOST, api_key=QDRANT_API_KEY, timeout=60)
     oai = get_openai_client()
-    log.info("AI Provider: %s", AI_PROVIDER)
+
+    # Google GenAI Client initialisieren (nur bei provider=google)
+    google_client = None
+    if EMBEDDING_PROVIDER == "google":
+        try:
+            google_client = get_google_genai_client()
+            log.info("Google GenAI Client initialisiert (Projekt=%s, Region=%s)", GOOGLE_PROJECT_ID, GOOGLE_REGION)
+        except Exception as e:
+            log.error("Google GenAI Client konnte nicht erstellt werden: %s", str(e))
+
+    log.info("Embedding Provider: %s, Model: %s, Dimensions: %d", EMBEDDING_PROVIDER, EMBEDDING_MODEL, VECTOR_DIM)
 
     # Cross-Encoder für Re-Ranking laden
     try:
@@ -136,7 +150,21 @@ async def lifespan(app: FastAPI):
         log.warning("Cross-Encoder konnte nicht geladen werden: %s — Re-Ranking deaktiviert", str(e))
         cross_encoder = None
 
-    if not qdrant.collection_exists(COLLECTION):
+    # Qdrant Collection: Erstellen oder bei Dimensions-Wechsel neu erstellen
+    if qdrant.collection_exists(COLLECTION):
+        info = qdrant.get_collection(COLLECTION)
+        current_dim = info.config.params.vectors.size
+        if current_dim != VECTOR_DIM:
+            log.warning("VECTOR_DIM geändert: %d → %d — Collection wird neu erstellt!", current_dim, VECTOR_DIM)
+            qdrant.delete_collection(COLLECTION)
+            qdrant.create_collection(
+                collection_name=COLLECTION,
+                vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE)
+            )
+            qdrant.create_payload_index(COLLECTION, "notebook_id", "keyword")
+            qdrant.create_payload_index(COLLECTION, "document_id", "keyword")
+            log.info("Collection %s neu erstellt mit dim=%d", COLLECTION, VECTOR_DIM)
+    else:
         qdrant.create_collection(
             collection_name=COLLECTION,
             vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE)
@@ -259,9 +287,7 @@ async def search(
     authorization: str = Header(None)
 ):
     auth(authorization)
-    embed_model = AZURE_OPENAI_EMBEDDING_DEPLOYMENT if AI_PROVIDER == "azure" else EMBEDDING_MODEL
-    resp = oai.embeddings.create(model=embed_model, input=query)
-    qvec = resp.data[0].embedding
+    qvec = embed_single(query)
     must = [FieldCondition(key="notebook_id", match=MatchValue(value=notebook_id))]
     if document_ids:
         ids = [d.strip() for d in document_ids.split(",") if d.strip()]
@@ -970,13 +996,63 @@ def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
         chunks.append({"text": text})
     return chunks
 
-def embed(texts):
-    embed_model = AZURE_OPENAI_EMBEDDING_DEPLOYMENT if AI_PROVIDER == "azure" else EMBEDDING_MODEL
+def embed_single(text):
+    """Einzelnen Text für Search-Query embedden – gibt einen Vektor zurück."""
+    vecs = embed([text], task_type="RETRIEVAL_QUERY")
+    return vecs[0]
+
+
+def embed(texts, task_type="RETRIEVAL_DOCUMENT"):
+    """Texte embedden – unterstützt OpenAI und Google Gemini Embedding 2.
+    task_type wird nur für Google genutzt (RETRIEVAL_DOCUMENT vs RETRIEVAL_QUERY).
+    """
+    if EMBEDDING_PROVIDER == "google":
+        return _embed_google(texts, task_type)
+    return _embed_openai(texts)
+
+
+def _embed_openai(texts):
+    """OpenAI Embedding (text-embedding-3-small/large)."""
     all_emb = []
     for i in range(0, len(texts), 100):
         batch = texts[i:i+100]
-        resp = oai.embeddings.create(model=embed_model, input=batch)
+        resp = oai.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=batch,
+            dimensions=EMBEDDING_DIMENSIONS,
+        )
         all_emb.extend([d.embedding for d in resp.data])
+    return all_emb
+
+
+def _embed_google(texts, task_type="RETRIEVAL_DOCUMENT"):
+    """Google Gemini Embedding 2 via Vertex AI.
+    task_type: RETRIEVAL_DOCUMENT für Chunks, RETRIEVAL_QUERY für Suchanfragen.
+    """
+    from google.genai import types
+    import numpy as np
+
+    all_emb = []
+    # Google API: max 100 Texte pro Request
+    for i in range(0, len(texts), 100):
+        batch = texts[i:i+100]
+        result = google_client.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=batch,
+            config=types.EmbedContentConfig(
+                task_type=task_type,
+                output_dimensionality=EMBEDDING_DIMENSIONS,
+            ),
+        )
+        for emb in result.embeddings:
+            vec = emb.values
+            # L2-Normalisierung für MRL truncated Dimensionen
+            if EMBEDDING_DIMENSIONS < 3072:
+                vec_np = np.array(vec)
+                norm = np.linalg.norm(vec_np)
+                if norm > 0:
+                    vec = (vec_np / norm).tolist()
+            all_emb.append(vec)
     return all_emb
 
 
@@ -1008,12 +1084,11 @@ def contextualize_chunks(chunks, full_text, job_id=""):
         doc_summary += "..."
 
     chat_client = get_chat_client()
-    chat_model = AZURE_OPENAI_CHAT_DEPLOYMENT if AI_PROVIDER == "azure" else "gpt-4.1-mini"
 
     for i, chunk in enumerate(chunks):
         try:
             response = chat_client.chat.completions.create(
-                model=chat_model,
+                model=CHAT_MODEL,
                 messages=[{
                     "role": "user",
                     "content": CONTEXT_PROMPT.format(
@@ -1142,9 +1217,8 @@ def research_pipeline(job_id, url, callback_url):
         input_text = combined_text[:80000]
 
         chat_client = get_chat_client()
-        chat_model = AZURE_OPENAI_CHAT_DEPLOYMENT if AI_PROVIDER == "azure" else "gpt-4.1-mini"
         response = chat_client.chat.completions.create(
-            model=chat_model,
+            model=CHAT_MODEL,
             messages=[
                 {"role": "system", "content": RESEARCH_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Erstelle ein umfangreiches Wissensdokument basierend auf folgendem Website-Inhalt:\n\n{input_text}"}
