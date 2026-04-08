@@ -212,6 +212,21 @@ def auth(authorization: str = Header(None)):
 async def health():
     return {"status": "ok", "active_jobs": len([j for j in jobs.values() if j["status"] == "processing"])}
 
+@app.post("/embed-test")
+async def embed_test(authorization: str = Header(None)):
+    """Minimaler Embedding-Test: Einen kurzen Text embedden und Vektor-Dimension zurückgeben."""
+    auth(authorization)
+    try:
+        vec = embed_single("Embedding test")
+        return {
+            "ok": True,
+            "dimensions": len(vec),
+            "provider": EMBEDDING_PROVIDER,
+            "model": EMBEDDING_MODEL,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @app.post("/process")
 async def process_doc(
     bg: BackgroundTasks,
