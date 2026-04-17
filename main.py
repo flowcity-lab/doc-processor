@@ -4,7 +4,7 @@ from typing import Optional
 from urllib.parse import urlparse, urljoin
 import httpx, openai
 import trafilatura
-from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, BackgroundTasks, Request
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct, Filter, FieldCondition,
@@ -242,6 +242,32 @@ async def embed_test(authorization: str = Header(None)):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+@app.post("/embed-texts")
+async def embed_texts(request: Request, authorization: str = Header(None)):
+    """Embeddet eine Liste kurzer Texte (z.B. Memory-Contents) und gibt Vektoren zurück.
+    Body: {"texts": ["...", "..."], "task_type": "RETRIEVAL_DOCUMENT"}
+    """
+    auth(authorization)
+    try:
+        body = await request.json()
+        texts = body.get("texts", [])
+        task_type = body.get("task_type", "RETRIEVAL_DOCUMENT")
+        if not isinstance(texts, list) or not texts:
+            return {"ok": False, "error": "texts muss ein nicht-leeres Array sein"}
+        if len(texts) > 200:
+            return {"ok": False, "error": "max 200 Texte pro Request"}
+        vecs = embed(texts, task_type=task_type)
+        return {
+            "ok": True,
+            "vectors": vecs,
+            "dimensions": len(vecs[0]) if vecs else 0,
+            "provider": EMBEDDING_PROVIDER,
+            "model": EMBEDDING_MODEL,
+        }
+    except Exception as e:
+        log.error("embed-texts Fehler: %s", str(e))
+        return {"ok": False, "error": str(e)}
+
 @app.post("/process")
 async def process_doc(
     bg: BackgroundTasks,
@@ -250,6 +276,7 @@ async def process_doc(
     notebook_id: str = Form(...),
     callback_url: str = Form(""),
     pdf_mode: str = Form("basic"),
+    chunking_strategy: str = Form("fixed"),
     existing_transcript: str = Form(""),
     authorization: str = Header(None)
 ):
@@ -263,13 +290,14 @@ async def process_doc(
             parsed_transcript = json.loads(existing_transcript)
         except Exception:
             parsed_transcript = None
+    strategy = chunking_strategy if chunking_strategy in ("fixed", "semantic") else "fixed"
     jobs[job_id] = {
         "job_id": job_id, "status": "queued", "step": "",
         "document_id": document_id, "notebook_id": notebook_id,
         "filename": file.filename, "chunks": 0, "error": None,
-        "pdf_mode": pdf_mode, "started_at": time.time()
+        "pdf_mode": pdf_mode, "chunking_strategy": strategy, "started_at": time.time()
     }
-    bg.add_task(pipeline, job_id, content, file.filename or "", document_id, notebook_id, callback_url, pdf_mode, parsed_transcript)
+    bg.add_task(pipeline, job_id, content, file.filename or "", document_id, notebook_id, callback_url, pdf_mode, parsed_transcript, strategy)
     return {"job_id": job_id, "status": "queued"}
 
 @app.post("/process-url")
@@ -280,17 +308,19 @@ async def process_url(
     notebook_id: str = Form(...),
     callback_url: str = Form(""),
     pdf_mode: str = Form("basic"),
+    chunking_strategy: str = Form("fixed"),
     authorization: str = Header(None)
 ):
     auth(authorization)
     job_id = str(uuid.uuid4())
+    strategy = chunking_strategy if chunking_strategy in ("fixed", "semantic") else "fixed"
     jobs[job_id] = {
         "job_id": job_id, "status": "queued", "step": "",
         "document_id": document_id, "notebook_id": notebook_id,
         "filename": url, "chunks": 0, "error": None,
-        "pdf_mode": pdf_mode, "started_at": time.time()
+        "pdf_mode": pdf_mode, "chunking_strategy": strategy, "started_at": time.time()
     }
-    bg.add_task(url_pipeline, job_id, url, document_id, notebook_id, callback_url, pdf_mode)
+    bg.add_task(url_pipeline, job_id, url, document_id, notebook_id, callback_url, pdf_mode, strategy)
     return {"job_id": job_id, "status": "queued"}
 
 @app.post("/research-url")
@@ -502,13 +532,16 @@ def prepare_audio(content, filename):
         if out_path and os.path.exists(out_path):
             os.unlink(out_path)
 
-def pipeline(job_id, content, filename, document_id, notebook_id, callback_url, pdf_mode="basic", existing_transcript=None):
+def pipeline(job_id, content, filename, document_id, notebook_id, callback_url, pdf_mode="basic", existing_transcript=None, chunking_strategy="fixed"):
     """
     pdf_mode:
         'basic'              – nur Text via Tika (Standard)
         'vision_description' – Bilder via Vision-LLM beschreiben (TODO: A6)
         'multimodal'         – Seiten direkt via Gemini Embedding 2 embedden (TODO: A7)
     existing_transcript: vorhandenes Transkript-Dict (spart Re-Transkription beim Reindex)
+    chunking_strategy:
+        'fixed'    – feste Wort-Anzahl pro Chunk (Standard)
+        'semantic' – Embedding-basierte Splits an inhaltlichen Grenzen
     """
     try:
         jobs[job_id]["status"] = "processing"
@@ -577,8 +610,11 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url, 
             raise Exception(f"No text extracted from {filename}")
         log.info("Job %s: %d chars from %s", job_id, len(text), filename)
         jobs[job_id]["step"] = "chunking"
-        chunks = chunk_text(text)
-        log.info("Job %s: %d chunks", job_id, len(chunks))
+        if chunking_strategy == "semantic":
+            chunks = semantic_chunk_text(text, job_id=job_id)
+        else:
+            chunks = chunk_text(text)
+        log.info("Job %s: %d chunks (strategy=%s)", job_id, len(chunks), chunking_strategy)
 
         # Phase 7: Contextual Retrieval — Chunks mit KI-Kontext anreichern
         if CONTEXTUAL_RETRIEVAL:
@@ -773,8 +809,10 @@ def discover_links(html, base_url):
     links.discard(base_clean + "/")
     return list(links)[:MAX_CRAWL_PAGES]
 
-def url_pipeline(job_id, url, document_id, notebook_id, callback_url, pdf_mode="basic"):
-    """URL(s) laden, Text extrahieren, chunken, embedden, speichern."""
+def url_pipeline(job_id, url, document_id, notebook_id, callback_url, pdf_mode="basic", chunking_strategy="fixed"):
+    """URL(s) laden, Text extrahieren, chunken, embedden, speichern.
+    chunking_strategy: 'fixed' (Default) oder 'semantic' (Embedding-basierte Splits).
+    """
     try:
         jobs[job_id]["status"] = "processing"
         jobs[job_id]["step"] = "fetching"
@@ -818,8 +856,11 @@ def url_pipeline(job_id, url, document_id, notebook_id, callback_url, pdf_mode="
 
         # Ab hier: gleiche Pipeline wie Datei-Upload
         jobs[job_id]["step"] = "chunking"
-        chunks = chunk_text(combined_text)
-        log.info("Job %s: %d chunks", job_id, len(chunks))
+        if chunking_strategy == "semantic":
+            chunks = semantic_chunk_text(combined_text, job_id=job_id)
+        else:
+            chunks = chunk_text(combined_text)
+        log.info("Job %s: %d chunks (strategy=%s)", job_id, len(chunks), chunking_strategy)
 
         # Phase 7: Contextual Retrieval
         if CONTEXTUAL_RETRIEVAL:
@@ -1292,6 +1333,94 @@ def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     if not chunks:
         chunks.append({"text": text})
     return chunks
+
+
+# === Semantic Chunking (A/B-Experiment) ===
+# Splittet Text an inhaltlichen Grenzen: zwischen aufeinanderfolgenden Sätzen wird
+# die Embedding-Distanz berechnet; Sätze werden zu Chunks zusammengefasst bis eine
+# "Bruchstelle" (Distanz im oberen Perzentil) oder die max. Länge erreicht ist.
+# Fallback auf chunk_text() bei Fehlern oder zu wenig Daten.
+_SENTENCE_BOUNDARY = re.compile(r'(?<=[\.\?!])\s+(?=[A-ZÄÖÜ0-9])')
+
+def _split_sentences(text: str) -> list:
+    """Einfache regex-basierte Satz-Segmentierung (DE/EN)."""
+    text = text.strip()
+    if not text:
+        return []
+    # Erst Absätze, dann Sätze pro Absatz – erhält strukturelle Grenzen
+    out = []
+    for para in text.split("\n\n"):
+        para = para.strip()
+        if not para:
+            continue
+        parts = _SENTENCE_BOUNDARY.split(para)
+        for p in parts:
+            p = p.strip()
+            if p:
+                out.append(p)
+    return out
+
+
+def semantic_chunk_text(text: str, max_words: int = CHUNK_SIZE, min_words: int = 50,
+                        breakpoint_percentile: int = 90, job_id=None):
+    """Embedding-basierte Chunk-Splits. Fällt bei Fehlern auf chunk_text() zurück.
+
+    breakpoint_percentile: Distanz-Perzentil, ab dem ein harter Split erzwungen wird
+    (90 = nur die obersten 10% der Satz-Übergänge bilden Chunk-Grenzen).
+    """
+    try:
+        import numpy as np
+
+        sentences = _split_sentences(text)
+        # Zu wenig Sätze → klassisches Chunking ist sinnvoller
+        if len(sentences) < 5:
+            return chunk_text(text)
+
+        # Embeddings für alle Sätze (batched)
+        sent_embeddings = embed(sentences, job_id=job_id)
+        vecs = np.array(sent_embeddings, dtype=np.float32)
+        # Cosine-Distanz zwischen aufeinanderfolgenden Sätzen
+        norms = np.linalg.norm(vecs, axis=1)
+        norms[norms == 0] = 1e-9
+        unit = vecs / norms[:, None]
+        sims = np.sum(unit[:-1] * unit[1:], axis=1)  # Länge = n-1
+        distances = 1.0 - sims
+
+        # Breakpoint-Threshold (z.B. oberstes 10%)
+        threshold = float(np.percentile(distances, breakpoint_percentile)) if len(distances) > 0 else 1.0
+
+        chunks = []
+        current = []
+        current_words = 0
+        for i, sentence in enumerate(sentences):
+            sent_words = len(sentence.split())
+            current.append(sentence)
+            current_words += sent_words
+
+            is_last = (i == len(sentences) - 1)
+            dist_here = distances[i] if i < len(distances) else None
+            hard_break = (dist_here is not None and dist_here >= threshold)
+            size_break = (current_words >= max_words)
+
+            if is_last or hard_break or size_break:
+                chunk_text_combined = " ".join(current).strip()
+                if current_words < min_words and chunks:
+                    # Zu kurz → mit vorherigem Chunk mergen
+                    chunks[-1]["text"] = (chunks[-1]["text"] + " " + chunk_text_combined).strip()
+                else:
+                    chunks.append({"text": chunk_text_combined})
+                current = []
+                current_words = 0
+
+        if not chunks:
+            chunks = [{"text": text.strip()}]
+
+        log.info("Semantic chunking: %d sentences → %d chunks (threshold=%.4f p%d)",
+                 len(sentences), len(chunks), threshold, breakpoint_percentile)
+        return chunks
+    except Exception as e:
+        log.warning("Job %s: semantic chunking failed (%s) – fallback to fixed", job_id, e)
+        return chunk_text(text)
 
 def embed_single(text):
     """Einzelnen Text für Search-Query embedden – gibt einen Vektor zurück."""
