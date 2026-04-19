@@ -268,6 +268,34 @@ async def embed_texts(request: Request, authorization: str = Header(None)):
         log.error("embed-texts Fehler: %s", str(e))
         return {"ok": False, "error": str(e)}
 
+@app.post("/extract")
+async def extract_plain(
+    file: UploadFile = File(...),
+    authorization: str = Header(None),
+):
+    """
+    Leichter Tika-Only Extraktions-Endpoint für Chat-Datei-Uploads.
+    Liefert nur extrahierten Text + Mime zurück – kein Qdrant, kein Chunking.
+    """
+    auth(authorization)
+    content = await file.read()
+    if not content:
+        raise HTTPException(400, "Empty file payload")
+
+    try:
+        text = extract(content)
+    except Exception as e:
+        log.exception("Plain extract failed for %s", file.filename)
+        raise HTTPException(502, f"Extraction failed: {e}")
+
+    return {
+        "text": text or "",
+        "mime": file.content_type or "application/octet-stream",
+        "filename": file.filename or "",
+        "size": len(content),
+    }
+
+
 @app.post("/process")
 async def process_doc(
     bg: BackgroundTasks,
