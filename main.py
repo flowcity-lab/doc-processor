@@ -307,7 +307,6 @@ async def process_doc(
     chunking_strategy: str = Form("fixed"),
     existing_transcript: str = Form(""),
     # Phase 4: PDF-Bildextraktion
-    pdf_figure_extraction_mode: str = Form("figures"),   # 'figures' | 'pages'
     pdf_figure_min_pixels: int = Form(40000),
     # Phase 3: URL-Bildextraktion (hier unbenutzt, nur fürs einheitliche Schema)
     url_image_extraction_enabled: str = Form("false"),
@@ -326,9 +325,7 @@ async def process_doc(
         except Exception:
             parsed_transcript = None
     strategy = chunking_strategy if chunking_strategy in ("fixed", "semantic") else "fixed"
-    fig_mode = pdf_figure_extraction_mode if pdf_figure_extraction_mode in ("figures", "pages") else "figures"
     image_opts = {
-        "pdf_figure_extraction_mode": fig_mode,
         "pdf_figure_min_pixels":      max(1000, int(pdf_figure_min_pixels)),
     }
     jobs[job_id] = {
@@ -351,7 +348,6 @@ async def process_url(
     pdf_mode: str = Form("basic"),
     chunking_strategy: str = Form("fixed"),
     # Phase 4: PDF-Bildextraktion (relevant für heruntergeladene PDFs)
-    pdf_figure_extraction_mode: str = Form("figures"),
     pdf_figure_min_pixels: int = Form(40000),
     # Phase 3: URL-Bildextraktion
     url_image_extraction_enabled: str = Form("false"),
@@ -362,9 +358,7 @@ async def process_url(
     auth(authorization)
     job_id = str(uuid.uuid4())
     strategy = chunking_strategy if chunking_strategy in ("fixed", "semantic") else "fixed"
-    fig_mode = pdf_figure_extraction_mode if pdf_figure_extraction_mode in ("figures", "pages") else "figures"
     image_opts = {
-        "pdf_figure_extraction_mode":   fig_mode,
         "pdf_figure_min_pixels":        max(1000, int(pdf_figure_min_pixels)),
         "url_image_extraction_enabled": str(url_image_extraction_enabled).lower() in ("true", "1", "yes"),
         "url_image_min_pixels":         max(1000, int(url_image_min_pixels)),
@@ -613,11 +607,9 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url, 
         'fixed'    – feste Wort-Anzahl pro Chunk (Standard)
         'semantic' – Embedding-basierte Splits an inhaltlichen Grenzen
     image_opts (dict, optional):
-        pdf_figure_extraction_mode: 'figures' (Default) | 'pages'
-        pdf_figure_min_pixels:      int, Filter für winzige Raster-Assets (Icons/Ornamente)
+        pdf_figure_min_pixels: int, Filter für winzige Raster-Assets (Icons/Ornamente)
     """
     image_opts = image_opts or {}
-    figure_mode = image_opts.get("pdf_figure_extraction_mode", "figures")
     fig_min_pixels = int(image_opts.get("pdf_figure_min_pixels", 40000))
 
     try:
@@ -649,41 +641,23 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url, 
                 jobs[job_id]["step"] = "extracting (multimodal images)"
                 # Phase 6: Dedup-Seed aus Qdrant — dasselbe Bild nicht doppelt embedden
                 seen_hashes = load_existing_image_hashes(notebook_id, exclude_document_id=document_id)
-                if figure_mode == "pages":
-                    image_chunks = extract_pdf_multimodal(content, job_id)
-                    for p in image_chunks:
-                        image_points.append(PointStruct(
-                            id=str(uuid.uuid4()), vector=p["vector"], payload={
-                                "text":          p["text"],
-                                "original_text": p["text"],
-                                "context":       "",
-                                "notebook_id":   notebook_id,
-                                "document_id":   document_id,
-                                "filename":      filename,
-                                "chunk_index":   -(p["page_num"]),  # negativer Index → Image-Punkt
-                                "has_image":     True,
-                                "image_b64":     p["image_b64"],
-                                "page_num":      p["page_num"],
-                            }
-                        ))
-                else:
-                    image_chunks = extract_pdf_figures(content, job_id, min_pixels=fig_min_pixels, seen_hashes=seen_hashes)
-                    for p in image_chunks:
-                        image_points.append(PointStruct(
-                            id=str(uuid.uuid4()), vector=p["vector"], payload={
-                                "text":          p["text"],
-                                "original_text": p["text"],
-                                "context":       "",
-                                "notebook_id":   notebook_id,
-                                "document_id":   document_id,
-                                "filename":      filename,
-                                "chunk_index":   -(p["figure_index"] + 1),  # negativer Index → Image-Punkt
-                                "has_image":     True,
-                                "image_b64":     p["image_b64"],
-                                "page_num":      p["page_num"],
-                                "image_hash":    p.get("image_hash"),
-                            }
-                        ))
+                image_chunks = extract_pdf_figures(content, job_id, min_pixels=fig_min_pixels, seen_hashes=seen_hashes)
+                for p in image_chunks:
+                    image_points.append(PointStruct(
+                        id=str(uuid.uuid4()), vector=p["vector"], payload={
+                            "text":          p["text"],
+                            "original_text": p["text"],
+                            "context":       "",
+                            "notebook_id":   notebook_id,
+                            "document_id":   document_id,
+                            "filename":      filename,
+                            "chunk_index":   -(p["figure_index"] + 1),  # negativer Index → Image-Punkt
+                            "has_image":     True,
+                            "image_b64":     p["image_b64"],
+                            "page_num":      p["page_num"],
+                            "image_hash":    p.get("image_hash"),
+                        }
+                    ))
                 if not image_points:
                     log.info("Job %s: keine Raster-Bilder extrahiert, nur Tika-Text", job_id)
             elif ext_lower == "pdf" and pdf_mode == "vision_description":
@@ -1463,85 +1437,6 @@ def extract_pdf_figures(content: bytes, job_id: str = "", min_pixels: int = 4000
     doc.close()
     log.info("Job %s: extract_pdf_figures → %d Abbildungen", job_id, len(results))
     return results
-
-
-def extract_pdf_multimodal(content: bytes, job_id: str = "") -> list[dict]:
-    """
-    A7/A8: PDF-Seiten als Bild direkt an Gemini Embedding 2 senden.
-    Gibt eine Liste von Dicts zurück: {vector, text, image_b64, page_num}
-    Fällt auf Tika-Text-Embedding zurück wenn Gemini nicht verfügbar.
-    """
-    if EMBEDDING_PROVIDER != "google" or not google_client:
-        log.warning("Multimodal PDF benötigt EMBEDDING_PROVIDER=google – Fallback auf Tika")
-        return []  # leere Liste → pipeline() nutzt dann Tika-Fallback
-
-    try:
-        import fitz
-        import base64 as _b64
-        from google.genai import types
-
-        doc = fitz.open(stream=content, filetype="pdf")
-        results = []
-
-        for page_num, page in enumerate(doc):
-            # Seite als JPEG rendern (100 DPI, komprimiert für Qdrant-Payload)
-            mat = fitz.Matrix(100 / 72, 100 / 72)
-            pix = page.get_pixmap(matrix=mat)
-            img_bytes = pix.tobytes("jpeg")
-            b64_img = _b64.b64encode(img_bytes).decode("utf-8")
-
-            # Seitentext als Fallback-Kontext
-            page_text = page.get_text().strip() or f"[Seite {page_num + 1} – kein Textlayer]"
-
-            # Gemini Embedding 2: Bild direkt embedden
-            try:
-                part = types.Part.from_bytes(
-                    data=_b64.b64decode(b64_img),
-                    mime_type="image/jpeg",
-                )
-                result = google_client.models.embed_content(
-                    model=EMBEDDING_MODEL,
-                    contents=[part],
-                    config=types.EmbedContentConfig(
-                        task_type="RETRIEVAL_DOCUMENT",
-                        output_dimensionality=EMBEDDING_DIMENSIONS,
-                    ),
-                )
-                vec = result.embeddings[0].values
-                if EMBEDDING_DIMENSIONS < 3072:
-                    import numpy as np
-                    v = np.array(vec)
-                    norm = np.linalg.norm(v)
-                    if norm > 0:
-                        vec = (v / norm).tolist()
-
-                results.append({
-                    "vector":    vec,
-                    "text":      page_text,
-                    "image_b64": b64_img,
-                    "page_num":  page_num + 1,
-                })
-
-                # Usage tracken
-                if job_id and job_id in jobs:
-                    usage = jobs[job_id].setdefault("usage", {})
-                    usage["embedding_tokens"] = usage.get("embedding_tokens", 0) + EMBEDDING_DIMENSIONS
-                    usage["embedding_model"]  = EMBEDDING_MODEL
-
-            except Exception as e:
-                log.warning("Multimodal Embedding Seite %d fehlgeschlagen: %s", page_num + 1, e)
-                # Seite ohne Bild-Embedding überspringen
-
-        doc.close()
-        log.info("Job %s: %d Seiten multimodal embedded", job_id, len(results))
-        return results
-
-    except ImportError:
-        log.warning("PyMuPDF nicht installiert – multimodal nicht möglich")
-        return []
-    except Exception as e:
-        log.error("PDF multimodal Extraktion fehlgeschlagen: %s", e)
-        return []
 
 
 def transcribe(content, filename):
