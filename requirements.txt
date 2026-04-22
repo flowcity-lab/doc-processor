@@ -6,10 +6,6 @@ openai
 qdrant-client
 trafilatura
 sentence-transformers
-google-genai
 numpy
 pymupdf
-google-auth
-beautifulsoup4
-pillow
 

@@ -19,30 +19,19 @@ QDRANT_HOST = os.environ.get("QDRANT_HOST", "http://qdrant:6333")
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY", "")
 TIKA_HOST = os.environ.get("TIKA_HOST", "http://tika:9998")
 
-# === Embedding Provider Switch ===
-# EMBEDDING_PROVIDER=openai  → OpenAI text-embedding-3-small/large
-# EMBEDDING_PROVIDER=google  → Google Gemini Embedding 2 (Vertex AI)
-EMBEDDING_PROVIDER = os.environ.get("EMBEDDING_PROVIDER", "openai")
+# === Embedding Configuration (OpenAI) ===
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
 EMBEDDING_DIMENSIONS = int(os.environ.get("EMBEDDING_DIMENSIONS", "1536"))
 
-# OpenAI API Key (für Embeddings bei provider=openai UND für Chat/Contextual Retrieval)
+# OpenAI API Key (für Embeddings und Chat/Contextual Retrieval)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-
-# Google Vertex AI (für Embeddings bei provider=google)
-GOOGLE_CREDENTIALS_BASE64 = os.environ.get("GOOGLE_CREDENTIALS_BASE64", "")
-GOOGLE_PROJECT_ID = os.environ.get("GOOGLE_PROJECT_ID", "")
-GOOGLE_REGION = os.environ.get("GOOGLE_REGION", "us-central1")
 
 # Chat-Modell für Contextual Retrieval & Research
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4.1-mini")
 
-# Dual-Audio-Embedding: Audiodateien zusätzlich direkt via Gemini embedden (benötigt Google)
-DUAL_AUDIO_EMBEDDING = os.environ.get("DUAL_AUDIO_EMBEDDING", "false").lower() == "true"
-
 
 def get_openai_client():
-    """Erstellt OpenAI-Client für Embeddings (bei provider=openai) und Chat."""
+    """Erstellt OpenAI-Client für Embeddings und Chat."""
     return openai.OpenAI(api_key=OPENAI_API_KEY)
 
 
@@ -50,24 +39,6 @@ def get_chat_client():
     """Erstellt OpenAI-Client für Chat-Completions (Contextual Retrieval, Research)."""
     return openai.OpenAI(api_key=OPENAI_API_KEY)
 
-
-def get_google_genai_client():
-    """Erstellt Google GenAI-Client für Gemini Embedding 2 (Vertex AI)."""
-    import base64, json, tempfile as _tf
-    from google import genai
-
-    if GOOGLE_CREDENTIALS_BASE64:
-        creds_json = base64.b64decode(GOOGLE_CREDENTIALS_BASE64).decode("utf-8")
-        creds_file = _tf.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
-        creds_file.write(creds_json)
-        creds_file.close()
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_file.name
-
-    return genai.Client(
-        vertexai=True,
-        project=GOOGLE_PROJECT_ID,
-        location=GOOGLE_REGION,
-    )
 
 COLLECTION = "notebook_documents"
 VECTOR_DIM = EMBEDDING_DIMENSIONS
@@ -81,7 +52,7 @@ PARENT_WINDOW_WORDS = int(os.environ.get("PARENT_WINDOW_WORDS", "1000"))  # Pare
 
 # === Phase 7: RAG Enhancement Config ===
 CONTEXTUAL_RETRIEVAL = os.environ.get("CONTEXTUAL_RETRIEVAL", "true").lower() == "true"
-# ADR-0003: Full-Doc-Contextual-Retrieval mit Gemini/GPT-4.1 1M-Context.
+# ADR-0003: Full-Doc-Contextual-Retrieval mit GPT-4.1 1M-Context.
 CONTEXTUAL_FULL_DOC = os.environ.get("CONTEXTUAL_FULL_DOC", "true").lower() == "true"
 CONTEXTUAL_MAX_DOC_CHARS = int(os.environ.get("CONTEXTUAL_MAX_DOC_CHARS", "800000"))  # ~200k Tokens
 
@@ -122,7 +93,6 @@ log = logging.getLogger("dps")
 jobs = {}
 qdrant = None
 oai = None
-google_client = None
 
 # TTL für abgeschlossene Jobs: nach 1 Stunde aus dem Speicher entfernen
 JOB_TTL_SECONDS = 3600
@@ -144,20 +114,11 @@ AUDIO_EXTENSIONS = ("mp3", "wav", "m4a", "ogg", "webm")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global qdrant, oai, google_client, cross_encoder
+    global qdrant, oai, cross_encoder
     qdrant = QdrantClient(url=QDRANT_HOST, api_key=QDRANT_API_KEY, timeout=60)
     oai = get_openai_client()
 
-    # Google GenAI Client initialisieren (nur bei provider=google)
-    google_client = None
-    if EMBEDDING_PROVIDER == "google":
-        try:
-            google_client = get_google_genai_client()
-            log.info("Google GenAI Client initialisiert (Projekt=%s, Region=%s)", GOOGLE_PROJECT_ID, GOOGLE_REGION)
-        except Exception as e:
-            log.error("Google GenAI Client konnte nicht erstellt werden: %s", str(e))
-
-    log.info("Embedding Provider: %s, Model: %s, Dimensions: %d", EMBEDDING_PROVIDER, EMBEDDING_MODEL, VECTOR_DIM)
+    log.info("Embedding: OpenAI %s, Dimensions: %d", EMBEDDING_MODEL, VECTOR_DIM)
 
     # Cross-Encoder für Re-Ranking laden (BGE-Reranker-v2-M3, ADR-0003)
     try:
@@ -189,18 +150,6 @@ async def lifespan(app: FastAPI):
         )
         qdrant.create_payload_index(COLLECTION, "notebook_id", "keyword")
         qdrant.create_payload_index(COLLECTION, "document_id", "keyword")
-
-    # Audio-Collection für Dual-Embedding (separate Flat-Vector Collection)
-    if DUAL_AUDIO_EMBEDDING and EMBEDDING_PROVIDER == "google":
-        audio_col = COLLECTION + "_audio"
-        if not qdrant.collection_exists(audio_col):
-            qdrant.create_collection(
-                collection_name=audio_col,
-                vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE)
-            )
-            qdrant.create_payload_index(audio_col, "document_id", "keyword")
-            qdrant.create_payload_index(audio_col, "notebook_id", "keyword")
-            log.info("Audio-Collection %s erstellt (Dual Embedding)", audio_col)
 
     # Text-Index für Hybrid Search (BM25-artig) erstellen falls noch nicht vorhanden
     try:
@@ -251,7 +200,7 @@ async def embed_test(authorization: str = Header(None)):
         return {
             "ok": True,
             "dimensions": len(vec),
-            "provider": EMBEDDING_PROVIDER,
+            "provider": "openai",
             "model": EMBEDDING_MODEL,
         }
     except Exception as e:
@@ -260,23 +209,22 @@ async def embed_test(authorization: str = Header(None)):
 @app.post("/embed-texts")
 async def embed_texts(request: Request, authorization: str = Header(None)):
     """Embeddet eine Liste kurzer Texte (z.B. Memory-Contents) und gibt Vektoren zurück.
-    Body: {"texts": ["...", "..."], "task_type": "RETRIEVAL_DOCUMENT"}
+    Body: {"texts": ["...", "..."]}
     """
     auth(authorization)
     try:
         body = await request.json()
         texts = body.get("texts", [])
-        task_type = body.get("task_type", "RETRIEVAL_DOCUMENT")
         if not isinstance(texts, list) or not texts:
             return {"ok": False, "error": "texts muss ein nicht-leeres Array sein"}
         if len(texts) > 200:
             return {"ok": False, "error": "max 200 Texte pro Request"}
-        vecs = embed(texts, task_type=task_type)
+        vecs = embed(texts)
         return {
             "ok": True,
             "vectors": vecs,
             "dimensions": len(vecs[0]) if vecs else 0,
-            "provider": EMBEDDING_PROVIDER,
+            "provider": "openai",
             "model": EMBEDDING_MODEL,
         }
     except Exception as e:
@@ -321,12 +269,6 @@ async def process_doc(
     pdf_mode: str = Form("basic"),
     chunking_strategy: str = Form("fixed"),
     existing_transcript: str = Form(""),
-    # Phase 4: PDF-Bildextraktion
-    pdf_figure_min_pixels: int = Form(40000),
-    # Phase 3: URL-Bildextraktion (hier unbenutzt, nur fürs einheitliche Schema)
-    url_image_extraction_enabled: str = Form("false"),
-    url_image_min_pixels: int = Form(10000),
-    url_image_max_per_page: int = Form(15),
     authorization: str = Header(None)
 ):
     auth(authorization)
@@ -340,9 +282,6 @@ async def process_doc(
         except Exception:
             parsed_transcript = None
     strategy = chunking_strategy if chunking_strategy in ("fixed", "semantic") else "fixed"
-    image_opts = {
-        "pdf_figure_min_pixels":      max(1000, int(pdf_figure_min_pixels)),
-    }
     jobs[job_id] = {
         "job_id": job_id, "status": "queued", "step": "",
         "document_id": document_id, "notebook_id": notebook_id,
@@ -350,7 +289,7 @@ async def process_doc(
         "pdf_mode": pdf_mode, "chunking_strategy": strategy, "started_at": time.time()
     }
     bg.add_task(pipeline, job_id, content, file.filename or "", document_id, notebook_id,
-                callback_url, pdf_mode, parsed_transcript, strategy, image_opts)
+                callback_url, pdf_mode, parsed_transcript, strategy)
     return {"job_id": job_id, "status": "queued"}
 
 @app.post("/process-url")
@@ -362,30 +301,18 @@ async def process_url(
     callback_url: str = Form(""),
     pdf_mode: str = Form("basic"),
     chunking_strategy: str = Form("fixed"),
-    # Phase 4: PDF-Bildextraktion (relevant für heruntergeladene PDFs)
-    pdf_figure_min_pixels: int = Form(40000),
-    # Phase 3: URL-Bildextraktion
-    url_image_extraction_enabled: str = Form("false"),
-    url_image_min_pixels: int = Form(10000),
-    url_image_max_per_page: int = Form(15),
     authorization: str = Header(None)
 ):
     auth(authorization)
     job_id = str(uuid.uuid4())
     strategy = chunking_strategy if chunking_strategy in ("fixed", "semantic") else "fixed"
-    image_opts = {
-        "pdf_figure_min_pixels":        max(1000, int(pdf_figure_min_pixels)),
-        "url_image_extraction_enabled": str(url_image_extraction_enabled).lower() in ("true", "1", "yes"),
-        "url_image_min_pixels":         max(1000, int(url_image_min_pixels)),
-        "url_image_max_per_page":       max(1, int(url_image_max_per_page)),
-    }
     jobs[job_id] = {
         "job_id": job_id, "status": "queued", "step": "",
         "document_id": document_id, "notebook_id": notebook_id,
         "filename": url, "chunks": 0, "error": None,
         "pdf_mode": pdf_mode, "chunking_strategy": strategy, "started_at": time.time()
     }
-    bg.add_task(url_pipeline, job_id, url, document_id, notebook_id, callback_url, pdf_mode, strategy, image_opts)
+    bg.add_task(url_pipeline, job_id, url, document_id, notebook_id, callback_url, pdf_mode, strategy)
     return {"job_id": job_id, "status": "queued"}
 
 @app.post("/research-url")
@@ -480,38 +407,14 @@ async def search(
         except Exception as e:
             log.warning("Text-Suche fehlgeschlagen: %s", str(e))
 
-    # 2b. Audio-Vektor-Suche (Dual Embedding) — sucht im Audio-Chunk auf Dokument-Ebene
-    audio_doc_ids = set()
-    if DUAL_AUDIO_EMBEDDING and EMBEDDING_PROVIDER == "google":
-        try:
-            audio_col = COLLECTION + "_audio"
-            if qdrant.collection_exists(audio_col):
-                audio_must = [FieldCondition(key="notebook_id", match=MatchValue(value=notebook_id))]
-                if document_ids:
-                    ids = [d.strip() for d in document_ids.split(",") if d.strip()]
-                    if ids:
-                        audio_must.append(FieldCondition(key="document_id", match=MatchAny(any=ids)))
-                audio_hits = qdrant.query_points(
-                    collection_name=audio_col, query=qvec,
-                    query_filter=Filter(must=audio_must), limit=top_k, with_payload=True
-                )
-                # document_ids aus Audio-Treffern sammeln → Text-Chunks dieser Dokumente bevorzugen
-                audio_doc_ids = {r.payload.get("document_id") for r in audio_hits.points if r.score > 0.7}
-                if audio_doc_ids:
-                    log.info("Dual-Audio: %d Dokumente via Audio-Vektor gefunden", len(audio_doc_ids))
-        except Exception as e:
-            log.warning("Audio-Suche fehlgeschlagen: %s", e)
-
     # 3. Ergebnisse mergen (Reciprocal Rank Fusion)
     scored = {}  # point_id -> {payload, rrf_score}
     # Vector-Ergebnisse
     for rank, r in enumerate(vector_results.points):
         pid = str(r.id)
-        # Audio-Dokumente erhalten Bonus-Score
-        audio_bonus = 0.3 if r.payload.get("document_id") in audio_doc_ids else 0.0
         scored[pid] = {
             "payload": r.payload,
-            "rrf_score": 1.0 / (60 + rank) + audio_bonus,
+            "rrf_score": 1.0 / (60 + rank),
             "vector_score": r.score,
         }
     # HyDE-Vector-Ergebnisse dazumischen (RAG 3.0)
@@ -569,8 +472,7 @@ async def search(
         if before != len(candidates):
             log.info("Score-Floor %.2f: %d → %d Kandidaten", effective_floor, before, len(candidates))
 
-    # Top-K zurückgeben. Bild-Felder werden optional mitgeliefert, damit Laravels
-    # RAG-Orchestrator/Gateway multimodale Treffer als sichtbare Abbildungen rendern kann.
+    # Top-K zurückgeben
     final = candidates[:top_k]
     out = []
     for c in final:
@@ -583,15 +485,7 @@ async def search(
             "filename":    p.get("filename", ""),
             "score":       c["final_score"],
         }
-        if p.get("has_image"):
-            item["has_image"]  = True
-            item["image_b64"]  = p.get("image_b64")
-            item["page_num"]   = p.get("page_num", 0)
-            if p.get("source_url"):
-                item["source_url"] = p.get("source_url")
-            if p.get("image_hash"):
-                item["image_hash"] = p.get("image_hash")
-        elif p.get("page_num"):
+        if p.get("page_num"):
             item["page_num"] = p.get("page_num")
         out.append(item)
     return {"results": out}
@@ -606,6 +500,28 @@ async def delete_doc(document_id: str, authorization: str = Header(None)):
         )
     )
     return {"status": "deleted", "document_id": document_id}
+
+@app.delete("/collections/reset")
+async def reset_collection(authorization: str = Header(None)):
+    """Droppt die Qdrant-Collection komplett und legt sie mit aktueller VECTOR_DIM neu an.
+    Wird vom Admin-UI nach Embedding-Dim-Wechsel ausgelöst. Alle Dokumente müssen danach
+    vom Laravel-Hub neu zum Indexieren eingereiht werden."""
+    auth(authorization)
+    try:
+        if qdrant.collection_exists(COLLECTION):
+            qdrant.delete_collection(COLLECTION)
+            log.warning("Collection %s per Admin-Request gedroppt", COLLECTION)
+        qdrant.create_collection(
+            collection_name=COLLECTION,
+            vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE),
+        )
+        qdrant.create_payload_index(COLLECTION, "notebook_id", "keyword")
+        qdrant.create_payload_index(COLLECTION, "document_id", "keyword")
+        log.info("Collection %s neu erstellt mit dim=%d", COLLECTION, VECTOR_DIM)
+        return {"status": "reset", "collection": COLLECTION, "dimensions": VECTOR_DIM}
+    except Exception as e:
+        log.exception("Collection-Reset fehlgeschlagen")
+        raise HTTPException(500, f"Reset failed: {e}")
 
 def prepare_audio(content, filename):
     """Konvertiert jedes Audio-Format zu MP3 und optimiert für STT via FFmpeg.
@@ -657,29 +573,20 @@ def prepare_audio(content, filename):
             os.unlink(out_path)
 
 def pipeline(job_id, content, filename, document_id, notebook_id, callback_url, pdf_mode="basic",
-             existing_transcript=None, chunking_strategy="fixed", image_opts=None):
+             existing_transcript=None, chunking_strategy="fixed"):
     """
     pdf_mode:
         'basic'              – nur Text via Tika (Standard)
         'vision_description' – Bilder via Vision-LLM beschreiben
-        'multimodal'         – zusätzlich Bilder direkt via Gemini Embedding 2 embedden
     existing_transcript: vorhandenes Transkript-Dict (spart Re-Transkription beim Reindex)
     chunking_strategy:
         'fixed'    – feste Wort-Anzahl pro Chunk (Standard)
         'semantic' – Embedding-basierte Splits an inhaltlichen Grenzen
-    image_opts (dict, optional):
-        pdf_figure_min_pixels: int, Filter für winzige Raster-Assets (Icons/Ornamente)
     """
-    image_opts = image_opts or {}
-    fig_min_pixels = int(image_opts.get("pdf_figure_min_pixels", 40000))
-
     try:
         jobs[job_id]["status"] = "processing"
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
         transcript_data = None
-        # Optional extrahierte Multimodal-Punkte (Bild-Vektoren) — werden am Ende zusätzlich
-        # zur Text-Pipeline in Qdrant gespeichert, wenn gefüllt.
-        image_points: list[PointStruct] = []
         if ext in AUDIO_EXTENSIONS:
             if existing_transcript and existing_transcript.get("full_text"):
                 # Vorhandenes Transkript wiederverwenden – keine erneute Transkription
@@ -694,42 +601,13 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url, 
         else:
             jobs[job_id]["step"] = "extracting"
             ext_lower = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-            if ext_lower == "pdf" and pdf_mode == "multimodal":
-                # Phase 4: Tika-Text IMMER parallel laufen lassen, damit das PDF auch ohne
-                # Raster-Bilder durchsuchbar bleibt. Bilder werden zusätzlich embedded.
-                jobs[job_id]["step"] = "extracting (multimodal text)"
-                text = extract(content)  # Tika-Text-Basis
-                jobs[job_id]["step"] = "extracting (multimodal images)"
-                # Phase 6: Dedup-Seed aus Qdrant — dasselbe Bild nicht doppelt embedden
-                seen_hashes = load_existing_image_hashes(notebook_id, exclude_document_id=document_id)
-                image_chunks = extract_pdf_figures(content, job_id, min_pixels=fig_min_pixels, seen_hashes=seen_hashes)
-                for p in image_chunks:
-                    image_points.append(PointStruct(
-                        id=str(uuid.uuid4()), vector=p["vector"], payload={
-                            "text":          p["text"],
-                            "original_text": p["text"],
-                            "context":       "",
-                            "notebook_id":   notebook_id,
-                            "document_id":   document_id,
-                            "filename":      filename,
-                            "chunk_index":   -(p["figure_index"] + 1),  # negativer Index → Image-Punkt
-                            "has_image":     True,
-                            "image_b64":     p["image_b64"],
-                            "page_num":      p["page_num"],
-                            "image_hash":    p.get("image_hash"),
-                        }
-                    ))
-                if not image_points:
-                    log.info("Job %s: keine Raster-Bilder extrahiert, nur Tika-Text", job_id)
-            elif ext_lower == "pdf" and pdf_mode == "vision_description":
+            if ext_lower == "pdf" and pdf_mode == "vision_description":
                 jobs[job_id]["step"] = "extracting (vision)"
                 text = extract_pdf_with_vision(content, job_id)
             else:
                 text = extract(content)
-        # Wenn weder Text noch Bild-Punkte vorhanden sind → Fehler. Wenn nur Bilder gefunden
-        # wurden (PDF ohne Textlayer), überspringen wir die Text-Pipeline und speichern nur Bilder.
         has_text = bool(text and len(text.strip()) >= 10)
-        if not has_text and not image_points:
+        if not has_text:
             raise Exception(f"No text extracted from {filename}")
 
         # Einmalig alle bisherigen Punkte dieses Dokuments löschen (für Re-Index)
@@ -740,80 +618,49 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url, 
             )
         )
 
-        chunks = []
-        if has_text:
-            log.info("Job %s: %d chars from %s", job_id, len(text), filename)
-            jobs[job_id]["step"] = "chunking"
-            if chunking_strategy == "semantic":
-                chunks = semantic_chunk_text(text, job_id=job_id)
-            else:
-                chunks = chunk_text(text)
-            log.info("Job %s: %d chunks (strategy=%s)", job_id, len(chunks), chunking_strategy)
+        log.info("Job %s: %d chars from %s", job_id, len(text), filename)
+        jobs[job_id]["step"] = "chunking"
+        if chunking_strategy == "semantic":
+            chunks = semantic_chunk_text(text, job_id=job_id)
+        else:
+            chunks = chunk_text(text)
+        log.info("Job %s: %d chunks (strategy=%s)", job_id, len(chunks), chunking_strategy)
 
-            # RAG 3.0 – Parent-Windows an jeden Child-Chunk anhängen (ADR-0003)
-            chunks = attach_parent_windows(chunks, text, window_words=PARENT_WINDOW_WORDS)
+        # RAG 3.0 – Parent-Windows an jeden Child-Chunk anhängen (ADR-0003)
+        chunks = attach_parent_windows(chunks, text, window_words=PARENT_WINDOW_WORDS)
 
-            # Phase 7: Contextual Retrieval — Chunks mit KI-Kontext anreichern
-            if CONTEXTUAL_RETRIEVAL:
-                jobs[job_id]["step"] = "contextualizing"
-                chunks = contextualize_chunks(chunks, text, job_id)
+        # Phase 7: Contextual Retrieval — Chunks mit KI-Kontext anreichern
+        if CONTEXTUAL_RETRIEVAL:
+            jobs[job_id]["step"] = "contextualizing"
+            chunks = contextualize_chunks(chunks, text, job_id)
 
-            jobs[job_id]["step"] = "embedding"
-            # Embedding auf kontextualisiertem Text (falls vorhanden)
-            embed_texts = [c.get("contextualized_text", c["text"]) for c in chunks]
-            embeddings = embed(embed_texts, job_id=job_id)
+        jobs[job_id]["step"] = "embedding"
+        # Embedding auf kontextualisiertem Text (falls vorhanden)
+        embed_texts = [c.get("contextualized_text", c["text"]) for c in chunks]
+        embeddings = embed(embed_texts, job_id=job_id)
 
-            jobs[job_id]["step"] = "storing"
-            points = [
-                PointStruct(id=str(uuid.uuid4()), vector=emb, payload={
-                    "text": c.get("contextualized_text", c["text"]),
-                    "original_text": c["text"],
-                    "parent_text": c.get("parent_text", c["text"]),
-                    "context": c.get("context", ""),
-                    "notebook_id": notebook_id,
-                    "document_id": document_id, "filename": filename, "chunk_index": i
-                })
-                for i, (c, emb) in enumerate(zip(chunks, embeddings))
-            ]
-            for i in range(0, len(points), 100):
-                qdrant.upsert(collection_name=COLLECTION, points=points[i:i+100])
+        jobs[job_id]["step"] = "storing"
+        points = [
+            PointStruct(id=str(uuid.uuid4()), vector=emb, payload={
+                "text": c.get("contextualized_text", c["text"]),
+                "original_text": c["text"],
+                "parent_text": c.get("parent_text", c["text"]),
+                "context": c.get("context", ""),
+                "notebook_id": notebook_id,
+                "document_id": document_id, "filename": filename, "chunk_index": i
+            })
+            for i, (c, emb) in enumerate(zip(chunks, embeddings))
+        ]
+        for i in range(0, len(points), 100):
+            qdrant.upsert(collection_name=COLLECTION, points=points[i:i+100])
 
-        # Multimodal-Bild-Punkte zusätzlich speichern (Phase 4)
-        if image_points:
-            jobs[job_id]["step"] = "storing_images"
-            for i in range(0, len(image_points), 50):
-                qdrant.upsert(collection_name=COLLECTION, points=image_points[i:i+50])
-            log.info("Job %s: %d Bild-Punkte gespeichert", job_id, len(image_points))
-
-        # Dual-Audio-Embedding: Gesamt-Audio als einen eigenen Vektor in der Audio-Collection
-        if DUAL_AUDIO_EMBEDDING and EMBEDDING_PROVIDER == "google" and ext in AUDIO_EXTENSIONS:
-            jobs[job_id]["step"] = "audio_embedding"
-            audio_vec = _embed_google_audio(content, mime_type="audio/mp3")
-            if audio_vec:
-                audio_col = COLLECTION + "_audio"
-                qdrant.delete(
-                    collection_name=audio_col,
-                    points_selector=FilterSelector(
-                        filter=Filter(must=[FieldCondition(key="document_id", match=MatchValue(value=document_id))])
-                    )
-                )
-                qdrant.upsert(
-                    collection_name=audio_col,
-                    points=[PointStruct(
-                        id=str(uuid.uuid4()),
-                        vector=audio_vec,
-                        payload={"document_id": document_id, "notebook_id": notebook_id, "filename": filename}
-                    )]
-                )
-                log.info("Job %s: Audio-Vektor in %s gespeichert", job_id, audio_col)
-
-        total_chunks = len(chunks) + len(image_points)
+        total_chunks = len(chunks)
         jobs[job_id]["status"] = "ready"
         jobs[job_id]["step"] = "done"
         jobs[job_id]["chunks"] = total_chunks
         if transcript_data:
             jobs[job_id]["transcript"] = transcript_data
-        log.info("Job %s: done, %d text + %d image chunks stored", job_id, len(chunks), len(image_points))
+        log.info("Job %s: done, %d text chunks stored", job_id, len(chunks))
         if callback_url:
             notify(callback_url, job_id, document_id, "ready", total_chunks,
                    transcript_data=transcript_data, usage=jobs[job_id].get("usage"))
@@ -920,140 +767,6 @@ def fetch_page(url):
     return text or "", page_title, html
 
 
-def extract_url_images(html: str, base_url: str, page_title: str = "",
-                       min_pixels: int = 10000, max_per_page: int = 15,
-                       seen_hashes: set | None = None, job_id: str = "") -> list[dict]:
-    """
-    Phase 3: <img>-Tags aus HTML parsen, Bilder herunterladen, nach Größe filtern und
-    via Gemini Embedding 2 multimodal embedden.
-
-    Gibt Liste von Dicts zurück: {vector, text, image_b64, page_num, image_hash, source_url,
-    alt, figure_index}. Bei fehlendem Google-Provider oder Pillow-Fehler → [].
-    """
-    if EMBEDDING_PROVIDER != "google" or not google_client:
-        return []
-    try:
-        from bs4 import BeautifulSoup
-        from PIL import Image
-        import hashlib, base64 as _b64
-    except ImportError as e:
-        log.warning("extract_url_images: Abhängigkeit fehlt (%s) — übersprungen", e)
-        return []
-
-    if seen_hashes is None:
-        seen_hashes = set()
-
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-    except Exception as e:
-        log.warning("BeautifulSoup Parsing fehlgeschlagen: %s", e)
-        return []
-
-    # Kandidaten-URLs einsammeln (mit Duplikat-Schutz)
-    candidates: list[tuple[str, str]] = []  # [(abs_url, alt_text)]
-    seen_urls: set[str] = set()
-    for img in soup.find_all("img"):
-        src = img.get("src") or img.get("data-src") or img.get("data-original") or ""
-        if not src:
-            srcset = img.get("srcset") or ""
-            if srcset:
-                src = srcset.split(",")[0].strip().split(" ")[0]
-        src = (src or "").strip()
-        if not src or src.startswith("data:"):
-            continue
-        abs_url = urljoin(base_url, src)
-        parsed = urlparse(abs_url)
-        if parsed.scheme not in ("http", "https"):
-            continue
-        if abs_url in seen_urls:
-            continue
-        # SVG überspringen (keine sinnvolle Embedding-Quelle via Gemini)
-        if parsed.path.lower().endswith(".svg"):
-            continue
-        seen_urls.add(abs_url)
-        alt = (img.get("alt") or "").strip()
-        candidates.append((abs_url, alt))
-        if len(candidates) >= max_per_page * 3:
-            # Hart-Cap gegen extrem bilderlastige Seiten — echter Cap erfolgt nach Filter
-            break
-
-    if not candidates:
-        return []
-
-    results: list[dict] = []
-    figure_index = 0
-
-    with httpx.Client(timeout=URL_TIMEOUT, follow_redirects=True,
-                      headers={"User-Agent": URL_USER_AGENT}) as client:
-        for abs_url, alt in candidates:
-            if len(results) >= max_per_page:
-                break
-            try:
-                r = client.get(abs_url)
-                if r.status_code != 200:
-                    continue
-                content_type = (r.headers.get("content-type") or "").lower()
-                if not content_type.startswith("image/") or "svg" in content_type:
-                    continue
-                img_bytes = r.content
-                if not img_bytes or len(img_bytes) < 500:
-                    continue
-
-                try:
-                    im = Image.open(io.BytesIO(img_bytes))
-                    w, h = im.size
-                    if w * h < min_pixels:
-                        continue
-                    if im.mode not in ("RGB", "L"):
-                        im = im.convert("RGB")
-                    MAX_SIDE = 1400
-                    if max(im.size) > MAX_SIDE:
-                        im.thumbnail((MAX_SIDE, MAX_SIDE))
-                    buf = io.BytesIO()
-                    im.save(buf, format="JPEG", quality=82, optimize=True)
-                    img_bytes = buf.getvalue()
-                except Exception as e:
-                    log.info("URL-Bild %s übersprungen (Pillow: %s)", abs_url, e)
-                    continue
-
-                img_hash = hashlib.sha256(img_bytes).hexdigest()
-                if img_hash in seen_hashes:
-                    continue
-                seen_hashes.add(img_hash)
-
-                vec = _embed_image_google(img_bytes, mime_type="image/jpeg")
-                if not vec:
-                    continue
-
-                # Text = alt-Text + Seiten-Titel (als Kontext für Text-Matching)
-                caption_bits = [p for p in [alt, page_title] if p]
-                caption = " — ".join(caption_bits) if caption_bits else f"[Bild von {base_url}]"
-
-                results.append({
-                    "vector":       vec,
-                    "text":         caption,
-                    "image_b64":    _b64.b64encode(img_bytes).decode("utf-8"),
-                    "page_num":     0,
-                    "image_hash":   img_hash,
-                    "source_url":   abs_url,
-                    "alt":          alt,
-                    "figure_index": figure_index,
-                })
-                figure_index += 1
-
-                if job_id and job_id in jobs:
-                    usage = jobs[job_id].setdefault("usage", {})
-                    usage["embedding_tokens"] = usage.get("embedding_tokens", 0) + EMBEDDING_DIMENSIONS
-                    usage["embedding_model"]  = EMBEDDING_MODEL
-                    usage["url_image_embeds"] = usage.get("url_image_embeds", 0) + 1
-
-            except Exception as e:
-                log.info("URL-Bild %s konnte nicht geladen werden: %s", abs_url, e)
-                continue
-
-    log.info("Job %s: extract_url_images(%s) → %d Bilder", job_id, base_url, len(results))
-    return results
-
 def discover_links(html, base_url):
     """Links auf gleicher Domain aus HTML extrahieren."""
     parsed_base = urlparse(base_url)
@@ -1086,16 +799,10 @@ def discover_links(html, base_url):
     return list(links)[:MAX_CRAWL_PAGES]
 
 def url_pipeline(job_id, url, document_id, notebook_id, callback_url, pdf_mode="basic",
-                 chunking_strategy="fixed", image_opts=None):
+                 chunking_strategy="fixed"):
     """URL(s) laden, Text extrahieren, chunken, embedden, speichern.
     chunking_strategy: 'fixed' (Default) oder 'semantic' (Embedding-basierte Splits).
-    image_opts: dict mit URL-Bildextraktions-Flags (Phase 3).
     """
-    image_opts = image_opts or {}
-    url_img_enabled = bool(image_opts.get("url_image_extraction_enabled", False))
-    url_img_min_pixels = int(image_opts.get("url_image_min_pixels", 10000))
-    url_img_max_per_page = int(image_opts.get("url_image_max_per_page", 15))
-
     try:
         jobs[job_id]["status"] = "processing"
         jobs[job_id]["step"] = "fetching"
@@ -1106,35 +813,6 @@ def url_pipeline(job_id, url, document_id, notebook_id, callback_url, pdf_mode="
         all_texts = []
         if main_text and len(main_text.strip()) > 10:
             all_texts.append(f"=== {main_title} – {url} ===\n{main_text}")
-
-        # Bild-Punkte (Phase 3) — werden am Ende zusätzlich in Qdrant gespeichert
-        image_points: list[PointStruct] = []
-        # Phase 6: Dedup-Seed aus Qdrant, damit dasselbe Bild nicht doppelt embedded wird
-        url_seen_hashes: set = load_existing_image_hashes(notebook_id, exclude_document_id=document_id) if url_img_enabled else set()
-
-        if url_img_enabled:
-            imgs = extract_url_images(
-                main_html, url, page_title=main_title,
-                min_pixels=url_img_min_pixels, max_per_page=url_img_max_per_page,
-                seen_hashes=url_seen_hashes, job_id=job_id,
-            )
-            for p in imgs:
-                image_points.append(PointStruct(
-                    id=str(uuid.uuid4()), vector=p["vector"], payload={
-                        "text":          p["text"],
-                        "original_text": p["text"],
-                        "context":       "",
-                        "notebook_id":   notebook_id,
-                        "document_id":   document_id,
-                        "filename":      url,
-                        "chunk_index":   -(p["figure_index"] + 1),
-                        "has_image":     True,
-                        "image_b64":     p["image_b64"],
-                        "page_num":      0,
-                        "image_hash":    p.get("image_hash"),
-                        "source_url":    p.get("source_url"),
-                    }
-                ))
 
         # Bei Domain-Root: Unterseiten crawlen
         if is_domain_root(url):
@@ -1151,40 +829,16 @@ def url_pipeline(job_id, url, document_id, notebook_id, callback_url, pdf_mode="
                                  job_id, i + 1, len(links), link, len(page_text))
                     else:
                         log.info("Job %s: skipped %s (no content)", job_id, link)
-
-                    if url_img_enabled:
-                        imgs = extract_url_images(
-                            page_html, link, page_title=page_title,
-                            min_pixels=url_img_min_pixels, max_per_page=url_img_max_per_page,
-                            seen_hashes=url_seen_hashes, job_id=job_id,
-                        )
-                        for p in imgs:
-                            image_points.append(PointStruct(
-                                id=str(uuid.uuid4()), vector=p["vector"], payload={
-                                    "text":          p["text"],
-                                    "original_text": p["text"],
-                                    "context":       "",
-                                    "notebook_id":   notebook_id,
-                                    "document_id":   document_id,
-                                    "filename":      link,
-                                    "chunk_index":   -(p["figure_index"] + 1 + len(image_points)),
-                                    "has_image":     True,
-                                    "image_b64":     p["image_b64"],
-                                    "page_num":      0,
-                                    "image_hash":    p.get("image_hash"),
-                                    "source_url":    p.get("source_url"),
-                                }
-                            ))
                 except Exception as ex:
                     log.warning("Job %s: failed to fetch %s: %s", job_id, link, str(ex))
 
         combined_text = "\n\n".join(all_texts)
         has_text = bool(combined_text and len(combined_text.strip()) >= 10)
-        if not has_text and not image_points:
+        if not has_text:
             raise Exception(f"No text extracted from {url}")
 
-        log.info("Job %s: %d chars total from %d pages, %d Bilder", job_id,
-                 len(combined_text), len(all_texts), len(image_points))
+        log.info("Job %s: %d chars total from %d pages", job_id,
+                 len(combined_text), len(all_texts))
 
         # Punkte dieses Dokuments entfernen (Re-Index-freundlich)
         qdrant.delete(
@@ -1194,54 +848,45 @@ def url_pipeline(job_id, url, document_id, notebook_id, callback_url, pdf_mode="
             )
         )
 
-        chunks = []
-        if has_text:
-            jobs[job_id]["step"] = "chunking"
-            if chunking_strategy == "semantic":
-                chunks = semantic_chunk_text(combined_text, job_id=job_id)
-            else:
-                chunks = chunk_text(combined_text)
-            log.info("Job %s: %d chunks (strategy=%s)", job_id, len(chunks), chunking_strategy)
+        jobs[job_id]["step"] = "chunking"
+        if chunking_strategy == "semantic":
+            chunks = semantic_chunk_text(combined_text, job_id=job_id)
+        else:
+            chunks = chunk_text(combined_text)
+        log.info("Job %s: %d chunks (strategy=%s)", job_id, len(chunks), chunking_strategy)
 
-            # RAG 3.0 – Parent-Windows (ADR-0003)
-            chunks = attach_parent_windows(chunks, combined_text, window_words=PARENT_WINDOW_WORDS)
+        # RAG 3.0 – Parent-Windows (ADR-0003)
+        chunks = attach_parent_windows(chunks, combined_text, window_words=PARENT_WINDOW_WORDS)
 
-            # Phase 7: Contextual Retrieval
-            if CONTEXTUAL_RETRIEVAL:
-                jobs[job_id]["step"] = "contextualizing"
-                chunks = contextualize_chunks(chunks, combined_text, job_id)
+        # Phase 7: Contextual Retrieval
+        if CONTEXTUAL_RETRIEVAL:
+            jobs[job_id]["step"] = "contextualizing"
+            chunks = contextualize_chunks(chunks, combined_text, job_id)
 
-            jobs[job_id]["step"] = "embedding"
-            embed_texts = [c.get("contextualized_text", c["text"]) for c in chunks]
-            embeddings = embed(embed_texts, job_id=job_id)
+        jobs[job_id]["step"] = "embedding"
+        embed_texts = [c.get("contextualized_text", c["text"]) for c in chunks]
+        embeddings = embed(embed_texts, job_id=job_id)
 
-            jobs[job_id]["step"] = "storing"
-            points = [
-                PointStruct(id=str(uuid.uuid4()), vector=emb, payload={
-                    "text": c.get("contextualized_text", c["text"]),
-                    "original_text": c["text"],
-                    "parent_text": c.get("parent_text", c["text"]),
-                    "context": c.get("context", ""),
-                    "notebook_id": notebook_id,
-                    "document_id": document_id, "filename": url, "chunk_index": i
-                })
-                for i, (c, emb) in enumerate(zip(chunks, embeddings))
-            ]
-            for i in range(0, len(points), 100):
-                qdrant.upsert(collection_name=COLLECTION, points=points[i:i + 100])
+        jobs[job_id]["step"] = "storing"
+        points = [
+            PointStruct(id=str(uuid.uuid4()), vector=emb, payload={
+                "text": c.get("contextualized_text", c["text"]),
+                "original_text": c["text"],
+                "parent_text": c.get("parent_text", c["text"]),
+                "context": c.get("context", ""),
+                "notebook_id": notebook_id,
+                "document_id": document_id, "filename": url, "chunk_index": i
+            })
+            for i, (c, emb) in enumerate(zip(chunks, embeddings))
+        ]
+        for i in range(0, len(points), 100):
+            qdrant.upsert(collection_name=COLLECTION, points=points[i:i + 100])
 
-        # URL-Bild-Punkte (Phase 3) zusätzlich speichern
-        if image_points:
-            jobs[job_id]["step"] = "storing_images"
-            for i in range(0, len(image_points), 50):
-                qdrant.upsert(collection_name=COLLECTION, points=image_points[i:i + 50])
-            log.info("Job %s: %d URL-Bild-Punkte gespeichert", job_id, len(image_points))
-
-        total = len(chunks) + len(image_points)
+        total = len(chunks)
         jobs[job_id]["status"] = "ready"
         jobs[job_id]["step"] = "done"
         jobs[job_id]["chunks"] = total
-        log.info("Job %s: done, %d Text + %d Bild-Chunks gespeichert", job_id, len(chunks), len(image_points))
+        log.info("Job %s: done, %d Text-Chunks gespeichert", job_id, len(chunks))
         if callback_url:
             notify(callback_url, job_id, document_id, "ready", total,
                    usage=jobs[job_id].get("usage"))
@@ -1327,185 +972,6 @@ def extract_pdf_with_vision(content: bytes, job_id: str = "") -> str:
     except Exception as e:
         log.error("PDF Vision-Extraktion fehlgeschlagen: %s – Fallback auf Tika", e)
         return extract(content)
-
-
-def load_existing_image_hashes(notebook_id: str, exclude_document_id: str = "") -> set:
-    """
-    Phase 6: Liefert alle `image_hash`-Werte, die für dieses Notebook bereits in Qdrant
-    gespeichert sind — exklusive des aktuellen Dokuments (damit Re-Index nicht das eigene
-    Dokument als "Duplikat" behandelt). Wird als Seed für `seen_hashes` in den
-    Extraktionsfunktionen verwendet, um identische Bilder nicht mehrfach zu embedden.
-    """
-    hashes: set = set()
-    try:
-        must = [
-            FieldCondition(key="notebook_id", match=MatchValue(value=notebook_id)),
-            FieldCondition(key="has_image",   match=MatchValue(value=True)),
-        ]
-        must_not = []
-        if exclude_document_id:
-            must_not.append(FieldCondition(key="document_id", match=MatchValue(value=exclude_document_id)))
-        next_page = None
-        while True:
-            res = qdrant.scroll(
-                collection_name=COLLECTION,
-                scroll_filter=Filter(must=must, must_not=must_not or None),
-                limit=256,
-                offset=next_page,
-                with_payload=True,
-                with_vectors=False,
-            )
-            points, next_page = res
-            for pt in points:
-                h = (pt.payload or {}).get("image_hash")
-                if h:
-                    hashes.add(h)
-            if next_page is None:
-                break
-    except Exception as e:
-        log.warning("load_existing_image_hashes fehlgeschlagen (notebook=%s): %s", notebook_id, e)
-    return hashes
-
-
-def _embed_image_google(img_bytes: bytes, mime_type: str = "image/jpeg") -> list[float] | None:
-    """Ein einzelnes Bild via Gemini Embedding 2 embedden. Gibt (normalisierten) Vektor zurück
-    oder None bei Fehler / wenn Provider != google."""
-    if EMBEDDING_PROVIDER != "google" or not google_client:
-        return None
-    try:
-        from google.genai import types
-        part = types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
-        result = google_client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=[part],
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_DOCUMENT",
-                output_dimensionality=EMBEDDING_DIMENSIONS,
-            ),
-        )
-        vec = result.embeddings[0].values
-        if EMBEDDING_DIMENSIONS < 3072:
-            import numpy as np
-            v = np.array(vec)
-            norm = np.linalg.norm(v)
-            if norm > 0:
-                vec = (v / norm).tolist()
-        return vec
-    except Exception as e:
-        log.warning("Bild-Embedding fehlgeschlagen: %s", e)
-        return None
-
-
-def extract_pdf_figures(content: bytes, job_id: str = "", min_pixels: int = 40000,
-                         seen_hashes: set | None = None) -> list[dict]:
-    """
-    Phase 4: Extrahiert jedes eingebettete Raster-Bild aus einem PDF einzeln und embeddet es via
-    Gemini Embedding 2. Vektor-Diagramme ohne Raster-Quelle werden hier nicht erfasst — der
-    Textlayer wird aber parallel via Tika verarbeitet, sodass das Dokument trotzdem durchsuchbar bleibt.
-
-    Gibt Liste von Dicts zurück: {vector, text, image_b64, page_num, image_hash, figure_index}.
-    Fällt auf leere Liste zurück wenn Provider != google oder PyMuPDF fehlt.
-    """
-    if EMBEDDING_PROVIDER != "google" or not google_client:
-        log.warning("extract_pdf_figures benötigt EMBEDDING_PROVIDER=google — übersprungen")
-        return []
-    try:
-        import fitz  # PyMuPDF
-        import hashlib, base64 as _b64
-    except ImportError:
-        log.warning("PyMuPDF nicht installiert — extract_pdf_figures übersprungen")
-        return []
-
-    if seen_hashes is None:
-        seen_hashes = set()
-
-    results: list[dict] = []
-    try:
-        doc = fitz.open(stream=content, filetype="pdf")
-    except Exception as e:
-        log.error("PDF konnte nicht geöffnet werden: %s", e)
-        return []
-
-    figure_index = 0
-    for page_num, page in enumerate(doc, start=1):
-        try:
-            page_text = (page.get_text() or "").strip()
-        except Exception:
-            page_text = ""
-
-        try:
-            images = page.get_images(full=True)
-        except Exception as e:
-            log.warning("get_images Seite %d fehlgeschlagen: %s", page_num, e)
-            continue
-
-        for img_info in images:
-            xref = img_info[0]
-            try:
-                base_img = doc.extract_image(xref)
-            except Exception as e:
-                log.warning("extract_image xref=%s Seite %d fehlgeschlagen: %s", xref, page_num, e)
-                continue
-
-            img_bytes = base_img.get("image")
-            if not img_bytes:
-                continue
-            ext = (base_img.get("ext") or "jpeg").lower()
-            width = int(base_img.get("width") or 0)
-            height = int(base_img.get("height") or 0)
-
-            # Größenfilter: Icons, Ornamente, Tracking-Pixel raus
-            if width * height < min_pixels:
-                continue
-
-            # Alpha/CMYK → RGB normalisieren, dann als JPEG serialisieren (kompakt für Payload)
-            try:
-                from PIL import Image
-                im = Image.open(io.BytesIO(img_bytes))
-                if im.mode not in ("RGB", "L"):
-                    im = im.convert("RGB")
-                # Downscale sehr großer Bilder (Payload-Größe begrenzen)
-                MAX_SIDE = 1400
-                if max(im.size) > MAX_SIDE:
-                    im.thumbnail((MAX_SIDE, MAX_SIDE))
-                buf = io.BytesIO()
-                im.save(buf, format="JPEG", quality=82, optimize=True)
-                img_bytes = buf.getvalue()
-                ext = "jpeg"
-            except Exception as e:
-                log.warning("Pillow-Reencoding fehlgeschlagen (Seite %d): %s — Original wird genutzt", page_num, e)
-
-            img_hash = hashlib.sha256(img_bytes).hexdigest()
-            if img_hash in seen_hashes:
-                continue
-            seen_hashes.add(img_hash)
-
-            vec = _embed_image_google(img_bytes, mime_type=f"image/{ext}")
-            if not vec:
-                continue
-
-            # Caption = Seiten-Textauszug (erste ~400 Zeichen) als Kontext für Text-Matching
-            caption = (page_text[:400] + ("…" if len(page_text) > 400 else "")) if page_text else f"[Seite {page_num} — Abbildung {figure_index + 1}]"
-
-            results.append({
-                "vector":        vec,
-                "text":          caption,
-                "image_b64":     _b64.b64encode(img_bytes).decode("utf-8"),
-                "page_num":      page_num,
-                "image_hash":    img_hash,
-                "figure_index":  figure_index,
-            })
-            figure_index += 1
-
-            if job_id and job_id in jobs:
-                usage = jobs[job_id].setdefault("usage", {})
-                usage["embedding_tokens"] = usage.get("embedding_tokens", 0) + EMBEDDING_DIMENSIONS
-                usage["embedding_model"]  = EMBEDDING_MODEL
-                usage["figure_embeds"]    = usage.get("figure_embeds", 0) + 1
-
-    doc.close()
-    log.info("Job %s: extract_pdf_figures → %d Abbildungen", job_id, len(results))
-    return results
 
 
 def transcribe(content, filename):
@@ -1912,22 +1378,15 @@ def semantic_chunk_text(text: str, max_words: int = CHUNK_SIZE, min_words: int =
 
 def embed_single(text):
     """Einzelnen Text für Search-Query embedden – gibt einen Vektor zurück."""
-    vecs = embed([text], task_type="RETRIEVAL_QUERY")
+    vecs = embed([text])
     return vecs[0]
 
 
-def embed(texts, task_type="RETRIEVAL_DOCUMENT", job_id=None):
-    """Texte embedden – unterstützt OpenAI und Google Gemini Embedding 2.
-    task_type wird nur für Google genutzt (RETRIEVAL_DOCUMENT vs RETRIEVAL_QUERY).
-    job_id: optional, für Usage-Tracking.
+def embed(texts, job_id=None, **_ignored):
+    """Texte via OpenAI Embedding (text-embedding-3-small/large) embedden.
+    job_id: optional, für Usage-Tracking. Zusätzliche Keyword-Argumente werden ignoriert
+    (Abwärtskompatibilität mit alten Call-Sites, die task_type übergeben haben).
     """
-    if EMBEDDING_PROVIDER == "google":
-        return _embed_google(texts, task_type)
-    return _embed_openai(texts, job_id=job_id)
-
-
-def _embed_openai(texts, job_id=None):
-    """OpenAI Embedding (text-embedding-3-small/large)."""
     all_emb = []
     for i in range(0, len(texts), 100):
         batch = texts[i:i+100]
@@ -1943,72 +1402,6 @@ def _embed_openai(texts, job_id=None):
             usage["embedding_tokens"] = usage.get("embedding_tokens", 0) + (resp.usage.total_tokens or 0)
             usage["embedding_model"]  = EMBEDDING_MODEL
     return all_emb
-
-
-def _embed_google(texts, task_type="RETRIEVAL_DOCUMENT"):
-    """Google Gemini Embedding 2 via Vertex AI.
-    task_type: RETRIEVAL_DOCUMENT für Chunks, RETRIEVAL_QUERY für Suchanfragen.
-    """
-    from google.genai import types
-    import numpy as np
-
-    all_emb = []
-    # Google API: max 100 Texte pro Request
-    for i in range(0, len(texts), 100):
-        batch = texts[i:i+100]
-        result = google_client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=batch,
-            config=types.EmbedContentConfig(
-                task_type=task_type,
-                output_dimensionality=EMBEDDING_DIMENSIONS,
-            ),
-        )
-        for emb in result.embeddings:
-            vec = emb.values
-            # L2-Normalisierung für MRL truncated Dimensionen
-            if EMBEDDING_DIMENSIONS < 3072:
-                vec_np = np.array(vec)
-                norm = np.linalg.norm(vec_np)
-                if norm > 0:
-                    vec = (vec_np / norm).tolist()
-            all_emb.append(vec)
-    return all_emb
-
-
-def _embed_google_audio(audio_bytes: bytes, mime_type: str = "audio/mp3") -> list | None:
-    """
-    Audio-Bytes direkt via Gemini Embedding 2 embedden (ohne Transkription).
-    Gibt einen einzelnen Vektor zurück oder None bei Fehler.
-    Nur verfügbar wenn EMBEDDING_PROVIDER=google.
-    """
-    if not google_client or EMBEDDING_PROVIDER != "google":
-        return None
-    try:
-        from google.genai import types
-        import base64 as _b64
-        encoded = _b64.b64encode(audio_bytes).decode("utf-8")
-        part = types.Part.from_bytes(data=encoded, mime_type=mime_type)
-        result = google_client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=[part],
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_DOCUMENT",
-                output_dimensionality=EMBEDDING_DIMENSIONS,
-            ),
-        )
-        emb = result.embeddings[0]
-        vec = emb.values
-        if EMBEDDING_DIMENSIONS < 3072:
-            import numpy as np
-            v = np.array(vec)
-            norm = np.linalg.norm(v)
-            if norm > 0:
-                vec = (v / norm).tolist()
-        return vec
-    except Exception as e:
-        log.warning("Audio-Embedding via Gemini fehlgeschlagen: %s", e)
-        return None
 
 
 # === Phase 7: Contextual Retrieval ===
@@ -2032,7 +1425,7 @@ def contextualize_chunks(chunks, full_text, job_id=""):
     RAG 3.0 (ADR-0003):
       - Bei CONTEXTUAL_FULL_DOC=true wird das gesamte Dokument (bis zum
         CONTEXTUAL_MAX_DOC_CHARS-Cap) in den Prompt gelegt. CHAT_MODEL muss ein
-        1M-Context-Modell sein (gpt-4.1-mini, gemini-2.5-flash).
+        1M-Context-Modell sein (gpt-4.1-mini).
       - Sonst Fallback auf 2000-Zeichen-Summary.
 
     Gibt Chunks mit 'context' und 'contextualized_text' Feldern zurück.
