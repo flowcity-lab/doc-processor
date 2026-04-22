@@ -112,10 +112,28 @@ def cleanup_old_jobs():
 
 AUDIO_EXTENSIONS = ("mp3", "wav", "m4a", "ogg", "webm")
 
+def _build_qdrant_client() -> QdrantClient:
+    """
+    qdrant-client fällt bei URLs ohne expliziten Port auf 6333 zurück — auch bei https.
+    Hinter einem Reverse-Proxy (443/80) führt das zu Connection refused. Deshalb hier
+    Port aus URL parsen und sonst Scheme-Default (443/80) verwenden.
+    """
+    parsed = urlparse(QDRANT_HOST)
+    if parsed.scheme in ("http", "https") and parsed.hostname and not parsed.port:
+        return QdrantClient(
+            host=parsed.hostname,
+            port=443 if parsed.scheme == "https" else 80,
+            https=parsed.scheme == "https",
+            api_key=QDRANT_API_KEY,
+            timeout=60,
+        )
+    return QdrantClient(url=QDRANT_HOST, api_key=QDRANT_API_KEY, timeout=60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global qdrant, oai, cross_encoder
-    qdrant = QdrantClient(url=QDRANT_HOST, api_key=QDRANT_API_KEY, timeout=60)
+    qdrant = _build_qdrant_client()
     oai = get_openai_client()
 
     log.info("Embedding: OpenAI %s, Dimensions: %d", EMBEDDING_MODEL, VECTOR_DIM)
