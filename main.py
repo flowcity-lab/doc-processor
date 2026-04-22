@@ -71,12 +71,26 @@ def get_google_genai_client():
 
 COLLECTION = "notebook_documents"
 VECTOR_DIM = EMBEDDING_DIMENSIONS
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
+
+# === RAG 3.0 – Chunk-Größen (ADR-0003) ===
+# Child-Chunks: kleine, präzise Einheiten für den Vektor-Recall.
+# Parent-Windows: größerer Kontext, der dem LLM beim Antworten geliefert wird.
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "250"))            # Child-Chunk-Wörter
+CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "50"))
+PARENT_WINDOW_WORDS = int(os.environ.get("PARENT_WINDOW_WORDS", "1000"))  # Parent-Kontext-Größe
 
 # === Phase 7: RAG Enhancement Config ===
 CONTEXTUAL_RETRIEVAL = os.environ.get("CONTEXTUAL_RETRIEVAL", "true").lower() == "true"
-CROSS_ENCODER_MODEL = os.environ.get("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+# ADR-0003: Full-Doc-Contextual-Retrieval mit Gemini/GPT-4.1 1M-Context.
+CONTEXTUAL_FULL_DOC = os.environ.get("CONTEXTUAL_FULL_DOC", "true").lower() == "true"
+CONTEXTUAL_MAX_DOC_CHARS = int(os.environ.get("CONTEXTUAL_MAX_DOC_CHARS", "800000"))  # ~200k Tokens
+
+# ADR-0003: BGE-Reranker-v2-M3 mit Sigmoid-Normalisierung auf [0,1].
+CROSS_ENCODER_MODEL = os.environ.get("CROSS_ENCODER_MODEL", "BAAI/bge-reranker-v2-m3")
+RERANKER_DEVICE = os.environ.get("RERANKER_DEVICE", "cpu")
+RERANKER_SIGMOID = os.environ.get("RERANKER_SIGMOID", "true").lower() == "true"
+RERANKER_SCORE_FLOOR = float(os.environ.get("RERANKER_SCORE_FLOOR", "0.0"))  # 0 = deaktiviert
+
 HYBRID_SEARCH_ENABLED = os.environ.get("HYBRID_SEARCH_ENABLED", "true").lower() == "true"
 RERANK_TOP_K = int(os.environ.get("RERANK_TOP_K", "20"))  # Anzahl Kandidaten vor Re-Ranking
 cross_encoder = None  # wird in lifespan initialisiert
@@ -145,10 +159,11 @@ async def lifespan(app: FastAPI):
 
     log.info("Embedding Provider: %s, Model: %s, Dimensions: %d", EMBEDDING_PROVIDER, EMBEDDING_MODEL, VECTOR_DIM)
 
-    # Cross-Encoder für Re-Ranking laden
+    # Cross-Encoder für Re-Ranking laden (BGE-Reranker-v2-M3, ADR-0003)
     try:
-        cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
-        log.info("Cross-Encoder geladen: %s", CROSS_ENCODER_MODEL)
+        cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL, device=RERANKER_DEVICE)
+        log.info("Cross-Encoder geladen: %s (device=%s, sigmoid=%s)",
+                 CROSS_ENCODER_MODEL, RERANKER_DEVICE, RERANKER_SIGMOID)
     except Exception as e:
         log.warning("Cross-Encoder konnte nicht geladen werden: %s — Re-Ranking deaktiviert", str(e))
         cross_encoder = None
@@ -404,10 +419,20 @@ async def search(
     notebook_id: str = Form(...),
     document_ids: str = Form(""),
     top_k: int = Form(5),
+    hypo_query: str = Form(""),  # RAG 3.0 – HyDE hypothetical answer (ADR-0003)
+    score_floor: float = Form(0.0),  # Reranker-Score-Floor, 0 = deaktiviert
     authorization: str = Header(None)
 ):
     auth(authorization)
     qvec = embed_single(query)
+    # HyDE: hypothetische Antwort separat embedden, später via RRF fusen
+    hypo_vec = None
+    if hypo_query and hypo_query.strip():
+        try:
+            hypo_vec = embed_single(hypo_query.strip())
+        except Exception as e:
+            log.warning("HyDE-Embedding fehlgeschlagen: %s", e)
+
     must = [FieldCondition(key="notebook_id", match=MatchValue(value=notebook_id))]
     if document_ids:
         ids = [d.strip() for d in document_ids.split(",") if d.strip()]
@@ -422,6 +447,18 @@ async def search(
         collection_name=COLLECTION, query=qvec,
         query_filter=Filter(must=must), limit=fetch_k, with_payload=True
     )
+
+    # 1b. HyDE-Vektor-Suche (parallel) – eigene Kandidaten-Liste
+    hypo_results_points = []
+    if hypo_vec is not None:
+        try:
+            hypo_hits = qdrant.query_points(
+                collection_name=COLLECTION, query=hypo_vec,
+                query_filter=Filter(must=must), limit=fetch_k, with_payload=True
+            )
+            hypo_results_points = hypo_hits.points
+        except Exception as e:
+            log.warning("HyDE-Suche fehlgeschlagen: %s", e)
 
     # 2. Text-Suche (BM25-artig) via Qdrant Full-Text Index
     text_results_points = []
@@ -477,6 +514,18 @@ async def search(
             "rrf_score": 1.0 / (60 + rank) + audio_bonus,
             "vector_score": r.score,
         }
+    # HyDE-Vector-Ergebnisse dazumischen (RAG 3.0)
+    for rank, r in enumerate(hypo_results_points):
+        pid = str(r.id)
+        rrf_add = 1.0 / (60 + rank)
+        if pid in scored:
+            scored[pid]["rrf_score"] += rrf_add
+        else:
+            scored[pid] = {
+                "payload": r.payload,
+                "rrf_score": rrf_add,
+                "vector_score": getattr(r, "score", 0.0) or 0.0,
+            }
     # Text-Ergebnisse dazumischen
     for rank, r in enumerate(text_results_points):
         pid = str(r.id)
@@ -493,11 +542,14 @@ async def search(
     # Nach RRF-Score sortieren
     candidates = sorted(scored.values(), key=lambda x: x["rrf_score"], reverse=True)[:fetch_k]
 
-    # 4. Re-Ranking mit Cross-Encoder
+    # 4. Re-Ranking mit Cross-Encoder (BGE-Reranker-v2-M3 + Sigmoid, ADR-0003)
     if cross_encoder and len(candidates) > 0:
         pairs = [(query, c["payload"].get("original_text", c["payload"].get("text", ""))) for c in candidates]
         try:
             ce_scores = cross_encoder.predict(pairs)
+            if RERANKER_SIGMOID:
+                import math
+                ce_scores = [1.0 / (1.0 + math.exp(-float(s))) for s in ce_scores]
             for i, score in enumerate(ce_scores):
                 candidates[i]["final_score"] = float(score)
             candidates.sort(key=lambda x: x["final_score"], reverse=True)
@@ -509,6 +561,14 @@ async def search(
         for c in candidates:
             c["final_score"] = c.get("vector_score", c["rrf_score"])
 
+    # Score-Floor (nur bei aktivem, sigmoidiertem Reranker sinnvoll)
+    effective_floor = score_floor if score_floor > 0 else RERANKER_SCORE_FLOOR
+    if cross_encoder and RERANKER_SIGMOID and effective_floor > 0:
+        before = len(candidates)
+        candidates = [c for c in candidates if c["final_score"] >= effective_floor]
+        if before != len(candidates):
+            log.info("Score-Floor %.2f: %d → %d Kandidaten", effective_floor, before, len(candidates))
+
     # Top-K zurückgeben. Bild-Felder werden optional mitgeliefert, damit Laravels
     # RAG-Orchestrator/Gateway multimodale Treffer als sichtbare Abbildungen rendern kann.
     final = candidates[:top_k]
@@ -517,6 +577,7 @@ async def search(
         p = c["payload"]
         item = {
             "text":        p.get("original_text", p.get("text", "")),
+            "parent_text": p.get("parent_text", p.get("original_text", p.get("text", ""))),
             "document_id": p.get("document_id", ""),
             "chunk_index": p.get("chunk_index", 0),
             "filename":    p.get("filename", ""),
@@ -689,6 +750,9 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url, 
                 chunks = chunk_text(text)
             log.info("Job %s: %d chunks (strategy=%s)", job_id, len(chunks), chunking_strategy)
 
+            # RAG 3.0 – Parent-Windows an jeden Child-Chunk anhängen (ADR-0003)
+            chunks = attach_parent_windows(chunks, text, window_words=PARENT_WINDOW_WORDS)
+
             # Phase 7: Contextual Retrieval — Chunks mit KI-Kontext anreichern
             if CONTEXTUAL_RETRIEVAL:
                 jobs[job_id]["step"] = "contextualizing"
@@ -704,6 +768,7 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url, 
                 PointStruct(id=str(uuid.uuid4()), vector=emb, payload={
                     "text": c.get("contextualized_text", c["text"]),
                     "original_text": c["text"],
+                    "parent_text": c.get("parent_text", c["text"]),
                     "context": c.get("context", ""),
                     "notebook_id": notebook_id,
                     "document_id": document_id, "filename": filename, "chunk_index": i
@@ -1138,6 +1203,9 @@ def url_pipeline(job_id, url, document_id, notebook_id, callback_url, pdf_mode="
                 chunks = chunk_text(combined_text)
             log.info("Job %s: %d chunks (strategy=%s)", job_id, len(chunks), chunking_strategy)
 
+            # RAG 3.0 – Parent-Windows (ADR-0003)
+            chunks = attach_parent_windows(chunks, combined_text, window_words=PARENT_WINDOW_WORDS)
+
             # Phase 7: Contextual Retrieval
             if CONTEXTUAL_RETRIEVAL:
                 jobs[job_id]["step"] = "contextualizing"
@@ -1152,6 +1220,7 @@ def url_pipeline(job_id, url, document_id, notebook_id, callback_url, pdf_mode="
                 PointStruct(id=str(uuid.uuid4()), vector=emb, payload={
                     "text": c.get("contextualized_text", c["text"]),
                     "original_text": c["text"],
+                    "parent_text": c.get("parent_text", c["text"]),
                     "context": c.get("context", ""),
                     "notebook_id": notebook_id,
                     "document_id": document_id, "filename": url, "chunk_index": i
@@ -1712,6 +1781,48 @@ def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     return chunks
 
 
+def attach_parent_windows(chunks, full_text, window_words=PARENT_WINDOW_WORDS):
+    """RAG 3.0 – Parent-Chunk-Retrieval (ADR-0003).
+
+    Berechnet für jeden Child-Chunk ein größeres Parent-Fenster im Original-Text
+    und hängt es als `parent_text` an. Recall läuft weiterhin auf den kleinen
+    Child-Embeddings, das LLM sieht aber beim Antworten den breiteren Kontext.
+
+    Fallback: Wenn der Chunk-Text im Original nicht gefunden wird (z.B. bei
+    semantischem Chunking mit Normalisierung), bleibt parent_text = chunk.text.
+    """
+    if not chunks or not full_text or window_words <= 0:
+        for c in chunks:
+            c.setdefault("parent_text", c["text"])
+        return chunks
+
+    full_words = full_text.split()
+    total_words = len(full_words)
+
+    # Schneller Lookup: Chunk-Text → Start-Position (First 6 Wörter)
+    for c in chunks:
+        chunk_words = c["text"].split()
+        if not chunk_words:
+            c["parent_text"] = c["text"]
+            continue
+
+        needle = " ".join(chunk_words[:6]).lower()
+        haystack_lower = " ".join(full_words).lower()
+        pos_char = haystack_lower.find(needle)
+        if pos_char < 0:
+            c["parent_text"] = c["text"]
+            continue
+
+        # Char → Word-Index
+        word_idx = haystack_lower.count(" ", 0, pos_char)
+        chunk_len = len(chunk_words)
+        pad = max(0, (window_words - chunk_len) // 2)
+        start = max(0, word_idx - pad)
+        end = min(total_words, word_idx + chunk_len + pad)
+        c["parent_text"] = " ".join(full_words[start:end])
+    return chunks
+
+
 # === Semantic Chunking (A/B-Experiment) ===
 # Splittet Text an inhaltlichen Grenzen: zwischen aufeinanderfolgenden Sätzen wird
 # die Embedding-Distanz berechnet; Sätze werden zu Chunks zusammengefasst bis eine
@@ -1917,15 +2028,29 @@ Gib einen kurzen, prägnanten Kontext (2-3 Sätze), der erklärt, wo dieser Chun
 
 def contextualize_chunks(chunks, full_text, job_id=""):
     """Reichert jeden Chunk mit KI-generiertem Kontext an (Contextual Retrieval).
+
+    RAG 3.0 (ADR-0003):
+      - Bei CONTEXTUAL_FULL_DOC=true wird das gesamte Dokument (bis zum
+        CONTEXTUAL_MAX_DOC_CHARS-Cap) in den Prompt gelegt. CHAT_MODEL muss ein
+        1M-Context-Modell sein (gpt-4.1-mini, gemini-2.5-flash).
+      - Sonst Fallback auf 2000-Zeichen-Summary.
+
     Gibt Chunks mit 'context' und 'contextualized_text' Feldern zurück.
     """
     if not CONTEXTUAL_RETRIEVAL or not chunks:
         return chunks
 
-    # Dokument-Zusammenfassung erstellen (max 2000 Zeichen für den Prompt)
-    doc_summary = full_text[:2000]
-    if len(full_text) > 2000:
-        doc_summary += "..."
+    # Dokument-Kontext-Fenster für den Prompt bestimmen
+    if CONTEXTUAL_FULL_DOC:
+        doc_for_prompt = full_text[:CONTEXTUAL_MAX_DOC_CHARS]
+        if len(full_text) > CONTEXTUAL_MAX_DOC_CHARS:
+            doc_for_prompt += "\n...[gekürzt]"
+            log.info("Job %s: Dokument auf %d Zeichen gekappt (full_text war %d)",
+                     job_id, CONTEXTUAL_MAX_DOC_CHARS, len(full_text))
+    else:
+        doc_for_prompt = full_text[:2000]
+        if len(full_text) > 2000:
+            doc_for_prompt += "..."
 
     chat_client = get_chat_client()
 
@@ -1936,7 +2061,7 @@ def contextualize_chunks(chunks, full_text, job_id=""):
                 messages=[{
                     "role": "user",
                     "content": CONTEXT_PROMPT.format(
-                        doc_summary=doc_summary,
+                        doc_summary=doc_for_prompt,
                         chunk_text=chunk["text"]
                     )
                 }],
@@ -1957,8 +2082,9 @@ def contextualize_chunks(chunks, full_text, job_id=""):
             chunk["context"] = ""
             chunk["contextualized_text"] = chunk["text"]
 
-    log.info("Job %s: %d/%d Chunks kontextualisiert", job_id,
-             sum(1 for c in chunks if c.get("context")), len(chunks))
+    log.info("Job %s: %d/%d Chunks kontextualisiert (full_doc=%s, doc_chars=%d)",
+             job_id, sum(1 for c in chunks if c.get("context")), len(chunks),
+             CONTEXTUAL_FULL_DOC, len(doc_for_prompt))
     return chunks
 
 
