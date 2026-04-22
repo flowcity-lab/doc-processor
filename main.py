@@ -1,4 +1,4 @@
-import os, uuid, time, io, logging, re, asyncio, subprocess, tempfile, json
+import os, uuid, time, io, logging, re, asyncio, subprocess, tempfile, json, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -36,9 +36,14 @@ def get_openai_client():
     return openai.OpenAI(api_key=OPENAI_API_KEY)
 
 
+# Höhere max_retries, damit das SDK den Retry-After-Header auf 429/TPM-Limits honorieren
+# kann — bei großen Dokumenten im Contextual-Retrieval-Fenster entstehen sonst Lücken.
+CONTEXTUAL_SDK_MAX_RETRIES = int(os.environ.get("CONTEXTUAL_SDK_MAX_RETRIES", "6"))
+
+
 def get_chat_client():
     """Erstellt OpenAI-Client für Chat-Completions (Contextual Retrieval, Research)."""
-    return openai.OpenAI(api_key=OPENAI_API_KEY)
+    return openai.OpenAI(api_key=OPENAI_API_KEY, max_retries=CONTEXTUAL_SDK_MAX_RETRIES)
 
 
 COLLECTION = "notebook_documents"
@@ -59,6 +64,46 @@ CONTEXTUAL_MAX_DOC_CHARS = int(os.environ.get("CONTEXTUAL_MAX_DOC_CHARS", "80000
 # Parallele OpenAI-Calls für Contextual Retrieval. 5 = guter Kompromiss
 # zwischen Durchsatz und OpenAI-Rate-Limits (tier-1 ~500 RPM für gpt-4.1-mini).
 CONTEXTUAL_CONCURRENCY = int(os.environ.get("CONTEXTUAL_CONCURRENCY", "5"))
+# Prozessweites Budget: begrenzt die Contextualize-Calls über ALLE parallel laufenden
+# Jobs (User A + User B uploaden gleichzeitig → trotzdem nur N gleichzeitige OpenAI-
+# Calls gegen die gemeinsame Org-TPM-Grenze). Default = CONTEXTUAL_CONCURRENCY.
+CONTEXTUAL_GLOBAL_BUDGET = int(os.environ.get("CONTEXTUAL_GLOBAL_BUDGET", str(CONTEXTUAL_CONCURRENCY)))
+_CONTEXTUAL_GLOBAL_SEM = threading.Semaphore(max(1, CONTEXTUAL_GLOBAL_BUDGET))
+
+# === Shared Rate-Limit-Window ===
+# Wenn irgendein Worker einen 429-TPM-Fehler bekommt, hält OpenAI uns für X Sekunden
+# komplett auf. Alle anderen laufenden Contextualize-/Vision-/Caption-Calls dürfen in
+# diesem Fenster gar nicht erst feuern, sonst fressen sie die nächsten 429er hintereinander.
+# Statt lokalem Sleep pro Worker teilen wir daher EINEN gemeinsamen "bis wann warten"-Wert.
+_rate_limit_lock = threading.Lock()
+_rate_limited_until = 0.0  # Unix-Timestamp, bis zu dem alle Chat-Calls pausieren
+
+def _parse_retry_after(msg: str) -> float:
+    """OpenAI-Fehlertext enthält 'Please try again in 6.103s' bei TPM-429."""
+    m = re.search(r"try again in ([0-9]+(?:\.[0-9]+)?)s", msg or "")
+    return float(m.group(1)) if m else 0.0
+
+def _wait_for_rate_limit_window():
+    """Blockiert, falls ein globales Rate-Limit-Fenster aktiv ist.
+    Wird vor jedem ausgehenden Chat-Call aufgerufen, damit parallel laufende Worker
+    nicht gleichzeitig in einen schon bekannten TPM-Penalty rennen."""
+    while True:
+        with _rate_limit_lock:
+            remaining = _rate_limited_until - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 5.0))
+
+def _note_rate_limit(wait_seconds: float):
+    """Setzt das globale Rate-Limit-Fenster auf max(current, now+wait_seconds).
+    Jitter wird vom Aufrufer dazugerechnet, damit Worker nicht synchron wieder feuern."""
+    if wait_seconds <= 0:
+        return
+    global _rate_limited_until
+    with _rate_limit_lock:
+        target = time.time() + wait_seconds
+        if target > _rate_limited_until:
+            _rate_limited_until = target
 
 # ADR-0003: BGE-Reranker-v2-M3 mit Sigmoid-Normalisierung auf [0,1].
 CROSS_ENCODER_MODEL = os.environ.get("CROSS_ENCODER_MODEL", "BAAI/bge-reranker-v2-m3")
@@ -353,6 +398,7 @@ async def process_url(
     url_image_extraction_enabled: str = Form("false"),
     url_image_min_pixels: int = Form(10000),
     url_image_max_per_page: int = Form(15),
+    crawl_subpages: str = Form("false"),
     authorization: str = Header(None)
 ):
     auth(authorization)
@@ -364,6 +410,7 @@ async def process_url(
         "url_image_min_pixels":         max(1000, int(url_image_min_pixels or 10000)),
         "url_image_max_per_page":       max(1, int(url_image_max_per_page or 15)),
     }
+    crawl_flag = str(crawl_subpages).lower() in ("1", "true", "yes")
     jobs[job_id] = {
         "job_id": job_id, "status": "queued", "step": "",
         "document_id": document_id, "notebook_id": notebook_id,
@@ -371,7 +418,7 @@ async def process_url(
         "pdf_mode": pdf_mode, "chunking_strategy": strategy, "started_at": time.time()
     }
     bg.add_task(url_pipeline, job_id, url, document_id, notebook_id, callback_url, pdf_mode,
-                strategy, image_opts)
+                strategy, image_opts, crawl_flag)
     return {"job_id": job_id, "status": "queued"}
 
 @app.post("/research-url")
@@ -927,19 +974,21 @@ def discover_links(html, base_url):
     return list(links)[:MAX_CRAWL_PAGES]
 
 def url_pipeline(job_id, url, document_id, notebook_id, callback_url, pdf_mode="basic",
-                 chunking_strategy="fixed", image_opts=None):
+                 chunking_strategy="fixed", image_opts=None, crawl_subpages=False):
     """URL(s) laden, Text extrahieren, chunken, embedden, speichern.
     chunking_strategy: 'fixed' (Default) oder 'semantic' (Embedding-basierte Splits).
     image_opts: wenn url_image_extraction_enabled=True, werden <img>-Tags der geladenen
                 Seiten extrahiert, per Vision-LLM beschrieben und als multimodale Chunks
                 gespeichert (has_image=True).
+    crawl_subpages: wenn True UND url ist Domain-Root, werden bis zu MAX_CRAWL_PAGES
+                Unterseiten mitgeladen. Standard False → nur die angegebene URL.
     """
     image_opts = image_opts or {}
     try:
         jobs[job_id]["status"] = "processing"
         jobs[job_id]["step"] = "fetching"
         url = normalize_url(url)
-        log.info("Job %s: fetching %s", job_id, url)
+        log.info("Job %s: fetching %s (crawl_subpages=%s)", job_id, url, crawl_subpages)
 
         main_text, main_title, main_html = fetch_page(url)
         all_texts = []
@@ -949,8 +998,8 @@ def url_pipeline(job_id, url, document_id, notebook_id, callback_url, pdf_mode="
         if main_html:
             page_htmls.append((url, main_html))
 
-        # Bei Domain-Root: Unterseiten crawlen
-        if is_domain_root(url):
+        # Nur bei Domain-Root UND explizit aktiviertem Flag: Unterseiten crawlen.
+        if crawl_subpages and is_domain_root(url):
             jobs[job_id]["step"] = "crawling"
             links = discover_links(main_html, url)
             log.info("Job %s: found %d links to crawl", job_id, len(links))
@@ -1102,41 +1151,58 @@ def extract_pdf_with_vision(content: bytes, job_id: str = "") -> str:
             # Text der Seite (aus PDF-Layer) als Kontext
             page_text = page.get_text().strip()
 
-            try:
-                prompt = (
-                    "Beschreibe den vollständigen Inhalt dieser PDF-Seite auf Deutsch. "
-                    "Extrahiere allen Text, Tabellen, Diagramme und Bilder als strukturierten Text. "
-                    "Ignoriere reine Designelemente ohne Informationsgehalt."
-                )
-                if page_text:
-                    prompt += f"\n\nExtrahierter Text der Seite (zur Kontrolle): {page_text[:500]}"
+            prompt = (
+                "Beschreibe den vollständigen Inhalt dieser PDF-Seite auf Deutsch. "
+                "Extrahiere allen Text, Tabellen, Diagramme und Bilder als strukturierten Text. "
+                "Ignoriere reine Designelemente ohne Informationsgehalt."
+            )
+            if page_text:
+                prompt += f"\n\nExtrahierter Text der Seite (zur Kontrolle): {page_text[:500]}"
 
-                response = oai.chat.completions.create(
-                    model=CHAT_MODEL,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}},
-                            {"type": "text", "text": prompt},
-                        ]
-                    }],
-                    max_tokens=1000,
-                )
-                description = response.choices[0].message.content.strip()
+            extra_retries = max(0, int(os.environ.get("CONTEXTUAL_EXTRA_RETRIES", "2")))
+            attempt = 0
+            description = None
+            while True:
+                _wait_for_rate_limit_window()
+                try:
+                    response = oai.chat.completions.create(
+                        model=CHAT_MODEL,
+                        messages=[{
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}},
+                                {"type": "text", "text": prompt},
+                            ]
+                        }],
+                        max_tokens=1000,
+                    )
+                    description = response.choices[0].message.content.strip()
+                    # Usage tracken
+                    if job_id and job_id in jobs:
+                        usage = jobs[job_id].setdefault("usage", {})
+                        usage["vision_calls"]       = usage.get("vision_calls", 0) + 1
+                        usage["context_tokens_in"]  = usage.get("context_tokens_in", 0) + (response.usage.prompt_tokens or 0)
+                        usage["context_tokens_out"] = usage.get("context_tokens_out", 0) + (response.usage.completion_tokens or 0)
+                        usage["context_model"]      = CHAT_MODEL
+                    break
+                except openai.RateLimitError as e:
+                    if attempt >= extra_retries:
+                        log.warning("Job %s: Vision-Beschreibung Seite %d nach TPM-Retries aufgegeben: %s",
+                                    job_id, page_num + 1, e)
+                        break
+                    wait = _parse_retry_after(str(e)) or (2.0 * (attempt + 1))
+                    _note_rate_limit(wait + 0.5)
+                    log.info("Job %s: Vision-Seite %d TPM-Limit, warte %.1fs (Versuch %d/%d)",
+                             job_id, page_num + 1, wait + 0.5, attempt + 1, extra_retries)
+                    attempt += 1
+                except Exception as e:
+                    log.warning("Job %s: Vision-Beschreibung Seite %d fehlgeschlagen: %s", job_id, page_num + 1, e)
+                    break
+
+            if description:
                 page_texts.append(f"[Seite {page_num + 1}]\n{description}")
-
-                # Usage tracken
-                if job_id and job_id in jobs:
-                    usage = jobs[job_id].setdefault("usage", {})
-                    usage["vision_calls"]       = usage.get("vision_calls", 0) + 1
-                    usage["context_tokens_in"]  = usage.get("context_tokens_in", 0) + (response.usage.prompt_tokens or 0)
-                    usage["context_tokens_out"] = usage.get("context_tokens_out", 0) + (response.usage.completion_tokens or 0)
-                    usage["context_model"]      = CHAT_MODEL
-
-            except Exception as e:
-                log.warning("Job %s: Vision-Beschreibung Seite %d fehlgeschlagen: %s", job_id, page_num + 1, e)
-                if page_text:
-                    page_texts.append(f"[Seite {page_num + 1}]\n{page_text}")
+            elif page_text:
+                page_texts.append(f"[Seite {page_num + 1}]\n{page_text}")
 
         doc.close()
         return "\n\n".join(page_texts) if page_texts else extract(content)
@@ -1151,37 +1217,50 @@ def extract_pdf_with_vision(content: bytes, job_id: str = "") -> str:
 
 def _caption_image_b64(b64_png: str, hint: str = "", job_id: str = "") -> str:
     """GPT-4o-Caption für ein einzelnes base64-PNG. Gibt leeren String bei Fehler."""
-    try:
-        prompt = (
-            "Beschreibe den Inhalt dieses Bildes knapp aber sachlich auf Deutsch. "
-            "Fasse Diagramme, Tabellen, Screenshots oder Illustrationen so zusammen, "
-            "dass ein Text-Chatbot das Bild später anhand der Beschreibung wiederfindet. "
-            "2–4 Sätze, keine Einleitung."
-        )
-        if hint:
-            prompt += f"\n\nKontext aus der Umgebung: {hint[:400]}"
-        response = oai.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_png}"}},
-                    {"type": "text", "text": prompt},
-                ]
-            }],
-            max_tokens=250,
-        )
-        caption = (response.choices[0].message.content or "").strip()
-        if job_id and job_id in jobs:
-            usage = jobs[job_id].setdefault("usage", {})
-            usage["vision_calls"]       = usage.get("vision_calls", 0) + 1
-            usage["context_tokens_in"]  = usage.get("context_tokens_in", 0) + (response.usage.prompt_tokens or 0)
-            usage["context_tokens_out"] = usage.get("context_tokens_out", 0) + (response.usage.completion_tokens or 0)
-            usage["context_model"]      = CHAT_MODEL
-        return caption
-    except Exception as e:
-        log.warning("Job %s: Bild-Caption fehlgeschlagen: %s", job_id, e)
-        return ""
+    prompt = (
+        "Beschreibe den Inhalt dieses Bildes knapp aber sachlich auf Deutsch. "
+        "Fasse Diagramme, Tabellen, Screenshots oder Illustrationen so zusammen, "
+        "dass ein Text-Chatbot das Bild später anhand der Beschreibung wiederfindet. "
+        "2–4 Sätze, keine Einleitung."
+    )
+    if hint:
+        prompt += f"\n\nKontext aus der Umgebung: {hint[:400]}"
+    extra_retries = max(0, int(os.environ.get("CONTEXTUAL_EXTRA_RETRIES", "2")))
+    attempt = 0
+    while True:
+        _wait_for_rate_limit_window()
+        try:
+            response = oai.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_png}"}},
+                        {"type": "text", "text": prompt},
+                    ]
+                }],
+                max_tokens=250,
+            )
+            caption = (response.choices[0].message.content or "").strip()
+            if job_id and job_id in jobs:
+                usage = jobs[job_id].setdefault("usage", {})
+                usage["vision_calls"]       = usage.get("vision_calls", 0) + 1
+                usage["context_tokens_in"]  = usage.get("context_tokens_in", 0) + (response.usage.prompt_tokens or 0)
+                usage["context_tokens_out"] = usage.get("context_tokens_out", 0) + (response.usage.completion_tokens or 0)
+                usage["context_model"]      = CHAT_MODEL
+            return caption
+        except openai.RateLimitError as e:
+            if attempt >= extra_retries:
+                log.warning("Job %s: Bild-Caption nach %d TPM-Retries aufgegeben: %s", job_id, attempt, e)
+                return ""
+            wait = _parse_retry_after(str(e)) or (2.0 * (attempt + 1))
+            _note_rate_limit(wait + 0.5)
+            log.info("Job %s: Bild-Caption TPM-Limit, warte %.1fs (Versuch %d/%d)",
+                     job_id, wait + 0.5, attempt + 1, extra_retries)
+            attempt += 1
+        except Exception as e:
+            log.warning("Job %s: Bild-Caption fehlgeschlagen: %s", job_id, e)
+            return ""
 
 
 def extract_pdf_figures(content: bytes, min_pixels: int = 40000, job_id: str = "") -> list:
@@ -1839,25 +1918,47 @@ def contextualize_chunks(chunks, full_text, job_id=""):
     chat_client = get_chat_client()
     started = time.time()
 
+    # Max. zusätzliche Retries nach dem SDK-internen Backoff (falls OpenAI-TPM-Limit
+    # mehrfach greift und der SDK-Retry-Pool erschöpft ist).
+    extra_retries = max(0, int(os.environ.get("CONTEXTUAL_EXTRA_RETRIES", "2")))
+
     def _contextualize_one(idx_chunk):
         i, chunk = idx_chunk
-        try:
-            response = chat_client.chat.completions.create(
-                model=CHAT_MODEL,
-                messages=[{
-                    "role": "user",
-                    "content": CONTEXT_PROMPT.format(
-                        doc_summary=doc_for_prompt,
-                        chunk_text=chunk["text"]
+        attempt = 0
+        # Prozessweites Budget: drosselt parallele Jobs untereinander, damit die
+        # gemeinsame OpenAI-Org-TPM-Grenze nicht von mehreren Uploads zerschossen wird.
+        with _CONTEXTUAL_GLOBAL_SEM:
+            while True:
+                # Gemeinsames Rate-Limit-Fenster respektieren, falls ein anderer Worker
+                # gerade in einen 429 gelaufen ist — spart Bursts und doppelte 429er.
+                _wait_for_rate_limit_window()
+                try:
+                    response = chat_client.chat.completions.create(
+                        model=CHAT_MODEL,
+                        messages=[{
+                            "role": "user",
+                            "content": CONTEXT_PROMPT.format(
+                                doc_summary=doc_for_prompt,
+                                chunk_text=chunk["text"]
+                            )
+                        }],
+                        temperature=0.0,
+                        max_tokens=150,
                     )
-                }],
-                temperature=0.0,
-                max_tokens=150,
-            )
-            context = response.choices[0].message.content.strip()
-            return (i, context, response.usage, None)
-        except Exception as e:
-            return (i, "", None, e)
+                    context = response.choices[0].message.content.strip()
+                    return (i, context, response.usage, None)
+                except openai.RateLimitError as e:
+                    if attempt >= extra_retries:
+                        return (i, "", None, e)
+                    wait = _parse_retry_after(str(e)) or (2.0 * (attempt + 1))
+                    # Kleiner Jitter, damit die Worker nicht synchron wieder feuern.
+                    jitter = 0.5 + (i % 5) * 0.3
+                    _note_rate_limit(wait + jitter)
+                    log.info("Job %s: Chunk %d – TPM-Limit, warte %.1fs (Versuch %d/%d)",
+                             job_id, i, wait + jitter, attempt + 1, extra_retries)
+                    attempt += 1
+                except Exception as e:
+                    return (i, "", None, e)
 
     # Parallele Ausführung mit Semaphore-artigem ThreadPool.
     # 52 Chunks × 2s seriell = 104s → bei concurrency=5 ≈ 20-25s.
