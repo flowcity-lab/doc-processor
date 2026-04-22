@@ -1,4 +1,5 @@
 import os, uuid, time, io, logging, re, asyncio, subprocess, tempfile, json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from typing import Optional
 from urllib.parse import urlparse, urljoin
@@ -55,6 +56,9 @@ CONTEXTUAL_RETRIEVAL = os.environ.get("CONTEXTUAL_RETRIEVAL", "true").lower() ==
 # ADR-0003: Full-Doc-Contextual-Retrieval mit GPT-4.1 1M-Context.
 CONTEXTUAL_FULL_DOC = os.environ.get("CONTEXTUAL_FULL_DOC", "true").lower() == "true"
 CONTEXTUAL_MAX_DOC_CHARS = int(os.environ.get("CONTEXTUAL_MAX_DOC_CHARS", "800000"))  # ~200k Tokens
+# Parallele OpenAI-Calls für Contextual Retrieval. 5 = guter Kompromiss
+# zwischen Durchsatz und OpenAI-Rate-Limits (tier-1 ~500 RPM für gpt-4.1-mini).
+CONTEXTUAL_CONCURRENCY = int(os.environ.get("CONTEXTUAL_CONCURRENCY", "5"))
 
 # ADR-0003: BGE-Reranker-v2-M3 mit Sigmoid-Normalisierung auf [0,1].
 CROSS_ENCODER_MODEL = os.environ.get("CROSS_ENCODER_MODEL", "BAAI/bge-reranker-v2-m3")
@@ -143,9 +147,25 @@ async def lifespan(app: FastAPI):
         cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL, device=RERANKER_DEVICE)
         log.info("Cross-Encoder geladen: %s (device=%s, sigmoid=%s)",
                  CROSS_ENCODER_MODEL, RERANKER_DEVICE, RERANKER_SIGMOID)
+        # Warmup: erste predict() materialisiert die Modell-Gewichte (~40-60s auf CPU).
+        # Ohne diesen Call würde die erste echte /search-Anfrage timeouten.
+        try:
+            warmup_start = time.time()
+            cross_encoder.predict([("warmup query", "warmup document")])
+            log.info("Cross-Encoder Warmup: %.1fs", time.time() - warmup_start)
+        except Exception as we:
+            log.warning("Cross-Encoder Warmup fehlgeschlagen: %s", str(we))
     except Exception as e:
         log.warning("Cross-Encoder konnte nicht geladen werden: %s — Re-Ranking deaktiviert", str(e))
         cross_encoder = None
+
+    # Embedding-Warmup: erster OpenAI-Call legt den HTTP-Client an und cached DNS/TLS.
+    try:
+        warmup_start = time.time()
+        embed_single("warmup")
+        log.info("Embedding-Client Warmup: %.1fs", time.time() - warmup_start)
+    except Exception as we:
+        log.warning("Embedding-Warmup fehlgeschlagen: %s", str(we))
 
     # Qdrant Collection: Erstellen oder bei Dimensions-Wechsel neu erstellen
     if qdrant.collection_exists(COLLECTION):
@@ -214,7 +234,7 @@ async def embed_test(authorization: str = Header(None)):
     """Minimaler Embedding-Test: Einen kurzen Text embedden und Vektor-Dimension zurückgeben."""
     auth(authorization)
     try:
-        vec = embed_single("Embedding test")
+        vec = await asyncio.to_thread(embed_single, "Embedding test")
         return {
             "ok": True,
             "dimensions": len(vec),
@@ -237,7 +257,7 @@ async def embed_texts(request: Request, authorization: str = Header(None)):
             return {"ok": False, "error": "texts muss ein nicht-leeres Array sein"}
         if len(texts) > 200:
             return {"ok": False, "error": "max 200 Texte pro Request"}
-        vecs = embed(texts)
+        vecs = await asyncio.to_thread(embed, texts)
         return {
             "ok": True,
             "vectors": vecs,
@@ -369,14 +389,22 @@ async def search(
     authorization: str = Header(None)
 ):
     auth(authorization)
-    qvec = embed_single(query)
-    # HyDE: hypothetische Antwort separat embedden, später via RRF fusen
+    # Query + HyDE parallel embedden (spart ~200-400ms wenn HyDE aktiv ist).
+    hypo_stripped = hypo_query.strip() if hypo_query else ""
+    embed_tasks = [asyncio.to_thread(embed_single, query)]
+    if hypo_stripped:
+        embed_tasks.append(asyncio.to_thread(embed_single, hypo_stripped))
+    embed_results = await asyncio.gather(*embed_tasks, return_exceptions=True)
+
+    if isinstance(embed_results[0], Exception):
+        raise HTTPException(502, f"Embedding failed: {embed_results[0]}")
+    qvec = embed_results[0]
     hypo_vec = None
-    if hypo_query and hypo_query.strip():
-        try:
-            hypo_vec = embed_single(hypo_query.strip())
-        except Exception as e:
-            log.warning("HyDE-Embedding fehlgeschlagen: %s", e)
+    if hypo_stripped:
+        if isinstance(embed_results[1], Exception):
+            log.warning("HyDE-Embedding fehlgeschlagen: %s", embed_results[1])
+        else:
+            hypo_vec = embed_results[1]
 
     must = [FieldCondition(key="notebook_id", match=MatchValue(value=notebook_id))]
     if document_ids:
@@ -387,43 +415,55 @@ async def search(
     # Phase 7: Hybrid Search — mehr Kandidaten holen für Re-Ranking
     fetch_k = RERANK_TOP_K if cross_encoder else top_k
 
-    # 1. Vektor-Suche (Semantic)
-    vector_results = qdrant.query_points(
-        collection_name=COLLECTION, query=qvec,
-        query_filter=Filter(must=must), limit=fetch_k, with_payload=True
-    )
+    # Qdrant-Calls (Vector, HyDE, Full-Text) parallel im Threadpool ausführen,
+    # damit der Event-Loop nicht für 3x Netz-Roundtrips blockiert wird.
+    def _vector_search(vec):
+        return qdrant.query_points(
+            collection_name=COLLECTION, query=vec,
+            query_filter=Filter(must=must), limit=fetch_k, with_payload=True
+        )
 
-    # 1b. HyDE-Vektor-Suche (parallel) – eigene Kandidaten-Liste
+    def _text_search():
+        if not HYBRID_SEARCH_ENABLED:
+            return None
+        from qdrant_client.models import MatchText
+        text_filter = Filter(must=[
+            *must,
+            FieldCondition(key="text", match=MatchText(text=query))
+        ])
+        return qdrant.scroll(
+            collection_name=COLLECTION,
+            scroll_filter=text_filter,
+            limit=fetch_k,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+    qdrant_tasks = [asyncio.to_thread(_vector_search, qvec)]
+    if hypo_vec is not None:
+        qdrant_tasks.append(asyncio.to_thread(_vector_search, hypo_vec))
+    else:
+        qdrant_tasks.append(asyncio.sleep(0, result=None))
+    qdrant_tasks.append(asyncio.to_thread(_text_search))
+    vec_res, hypo_res, text_res = await asyncio.gather(*qdrant_tasks, return_exceptions=True)
+
+    if isinstance(vec_res, Exception):
+        raise HTTPException(502, f"Vector search failed: {vec_res}")
+    vector_results = vec_res
+
     hypo_results_points = []
     if hypo_vec is not None:
-        try:
-            hypo_hits = qdrant.query_points(
-                collection_name=COLLECTION, query=hypo_vec,
-                query_filter=Filter(must=must), limit=fetch_k, with_payload=True
-            )
-            hypo_results_points = hypo_hits.points
-        except Exception as e:
-            log.warning("HyDE-Suche fehlgeschlagen: %s", e)
+        if isinstance(hypo_res, Exception):
+            log.warning("HyDE-Suche fehlgeschlagen: %s", hypo_res)
+        elif hypo_res is not None:
+            hypo_results_points = hypo_res.points
 
-    # 2. Text-Suche (BM25-artig) via Qdrant Full-Text Index
     text_results_points = []
     if HYBRID_SEARCH_ENABLED:
-        try:
-            from qdrant_client.models import MatchText
-            text_filter = Filter(must=[
-                *must,
-                FieldCondition(key="text", match=MatchText(text=query))
-            ])
-            text_results = qdrant.scroll(
-                collection_name=COLLECTION,
-                scroll_filter=text_filter,
-                limit=fetch_k,
-                with_payload=True,
-                with_vectors=False,
-            )
-            text_results_points = text_results[0] if text_results else []
-        except Exception as e:
-            log.warning("Text-Suche fehlgeschlagen: %s", str(e))
+        if isinstance(text_res, Exception):
+            log.warning("Text-Suche fehlgeschlagen: %s", str(text_res))
+        elif text_res is not None:
+            text_results_points = text_res[0] if text_res else []
 
     # 3. Ergebnisse mergen (Reciprocal Rank Fusion)
     scored = {}  # point_id -> {payload, rrf_score}
@@ -464,10 +504,12 @@ async def search(
     candidates = sorted(scored.values(), key=lambda x: x["rrf_score"], reverse=True)[:fetch_k]
 
     # 4. Re-Ranking mit Cross-Encoder (BGE-Reranker-v2-M3 + Sigmoid, ADR-0003)
+    # CPU-bound predict() in Threadpool auslagern, sonst blockiert es den Event-Loop
+    # für alle anderen parallelen Requests (40-60s bei 20 Kandidaten).
     if cross_encoder and len(candidates) > 0:
         pairs = [(query, c["payload"].get("original_text", c["payload"].get("text", ""))) for c in candidates]
         try:
-            ce_scores = cross_encoder.predict(pairs)
+            ce_scores = await asyncio.to_thread(cross_encoder.predict, pairs)
             if RERANKER_SIGMOID:
                 import math
                 ce_scores = [1.0 / (1.0 + math.exp(-float(s))) for s in ce_scores]
@@ -1464,8 +1506,10 @@ def contextualize_chunks(chunks, full_text, job_id=""):
             doc_for_prompt += "..."
 
     chat_client = get_chat_client()
+    started = time.time()
 
-    for i, chunk in enumerate(chunks):
+    def _contextualize_one(idx_chunk):
+        i, chunk = idx_chunk
         try:
             response = chat_client.chat.completions.create(
                 model=CHAT_MODEL,
@@ -1480,22 +1524,34 @@ def contextualize_chunks(chunks, full_text, job_id=""):
                 max_tokens=150,
             )
             context = response.choices[0].message.content.strip()
-            chunk["context"] = context
-            chunk["contextualized_text"] = f"{context}\n\n{chunk['text']}"
-            # Usage-Tracking: Contextual-Retrieval-Tokens akkumulieren
-            if job_id and job_id in jobs:
-                usage = jobs[job_id].setdefault("usage", {})
-                usage["context_tokens_in"]  = usage.get("context_tokens_in", 0)  + (response.usage.prompt_tokens or 0)
-                usage["context_tokens_out"] = usage.get("context_tokens_out", 0) + (response.usage.completion_tokens or 0)
-                usage["context_model"]      = CHAT_MODEL
+            return (i, context, response.usage, None)
         except Exception as e:
-            log.warning("Job %s: Kontext für Chunk %d fehlgeschlagen: %s", job_id, i, str(e))
-            chunk["context"] = ""
-            chunk["contextualized_text"] = chunk["text"]
+            return (i, "", None, e)
 
-    log.info("Job %s: %d/%d Chunks kontextualisiert (full_doc=%s, doc_chars=%d)",
+    # Parallele Ausführung mit Semaphore-artigem ThreadPool.
+    # 52 Chunks × 2s seriell = 104s → bei concurrency=5 ≈ 20-25s.
+    workers = max(1, min(CONTEXTUAL_CONCURRENCY, len(chunks)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_contextualize_one, (i, c)) for i, c in enumerate(chunks)]
+        for fut in as_completed(futures):
+            i, context, usage_info, err = fut.result()
+            if err is not None:
+                log.warning("Job %s: Kontext für Chunk %d fehlgeschlagen: %s", job_id, i, str(err))
+                chunks[i]["context"] = ""
+                chunks[i]["contextualized_text"] = chunks[i]["text"]
+                continue
+            chunks[i]["context"] = context
+            chunks[i]["contextualized_text"] = f"{context}\n\n{chunks[i]['text']}"
+            if job_id and job_id in jobs and usage_info is not None:
+                usage = jobs[job_id].setdefault("usage", {})
+                usage["context_tokens_in"]  = usage.get("context_tokens_in", 0)  + (usage_info.prompt_tokens or 0)
+                usage["context_tokens_out"] = usage.get("context_tokens_out", 0) + (usage_info.completion_tokens or 0)
+                usage["context_model"]      = CHAT_MODEL
+
+    elapsed = time.time() - started
+    log.info("Job %s: %d/%d Chunks kontextualisiert in %.1fs (concurrency=%d, full_doc=%s, doc_chars=%d)",
              job_id, sum(1 for c in chunks if c.get("context")), len(chunks),
-             CONTEXTUAL_FULL_DOC, len(doc_for_prompt))
+             elapsed, workers, CONTEXTUAL_FULL_DOC, len(doc_for_prompt))
     return chunks
 
 
