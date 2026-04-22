@@ -307,6 +307,10 @@ async def process_doc(
     pdf_mode: str = Form("basic"),
     chunking_strategy: str = Form("fixed"),
     existing_transcript: str = Form(""),
+    pdf_figure_min_pixels: int = Form(40000),
+    url_image_extraction_enabled: str = Form("false"),
+    url_image_min_pixels: int = Form(10000),
+    url_image_max_per_page: int = Form(15),
     authorization: str = Header(None)
 ):
     auth(authorization)
@@ -320,6 +324,12 @@ async def process_doc(
         except Exception:
             parsed_transcript = None
     strategy = chunking_strategy if chunking_strategy in ("fixed", "semantic") else "fixed"
+    image_opts = {
+        "pdf_figure_min_pixels":        max(1000, int(pdf_figure_min_pixels or 40000)),
+        "url_image_extraction_enabled": str(url_image_extraction_enabled).lower() in ("1", "true", "yes"),
+        "url_image_min_pixels":         max(1000, int(url_image_min_pixels or 10000)),
+        "url_image_max_per_page":       max(1, int(url_image_max_per_page or 15)),
+    }
     jobs[job_id] = {
         "job_id": job_id, "status": "queued", "step": "",
         "document_id": document_id, "notebook_id": notebook_id,
@@ -327,7 +337,7 @@ async def process_doc(
         "pdf_mode": pdf_mode, "chunking_strategy": strategy, "started_at": time.time()
     }
     bg.add_task(pipeline, job_id, content, file.filename or "", document_id, notebook_id,
-                callback_url, pdf_mode, parsed_transcript, strategy)
+                callback_url, pdf_mode, parsed_transcript, strategy, image_opts)
     return {"job_id": job_id, "status": "queued"}
 
 @app.post("/process-url")
@@ -339,18 +349,29 @@ async def process_url(
     callback_url: str = Form(""),
     pdf_mode: str = Form("basic"),
     chunking_strategy: str = Form("fixed"),
+    pdf_figure_min_pixels: int = Form(40000),
+    url_image_extraction_enabled: str = Form("false"),
+    url_image_min_pixels: int = Form(10000),
+    url_image_max_per_page: int = Form(15),
     authorization: str = Header(None)
 ):
     auth(authorization)
     job_id = str(uuid.uuid4())
     strategy = chunking_strategy if chunking_strategy in ("fixed", "semantic") else "fixed"
+    image_opts = {
+        "pdf_figure_min_pixels":        max(1000, int(pdf_figure_min_pixels or 40000)),
+        "url_image_extraction_enabled": str(url_image_extraction_enabled).lower() in ("1", "true", "yes"),
+        "url_image_min_pixels":         max(1000, int(url_image_min_pixels or 10000)),
+        "url_image_max_per_page":       max(1, int(url_image_max_per_page or 15)),
+    }
     jobs[job_id] = {
         "job_id": job_id, "status": "queued", "step": "",
         "document_id": document_id, "notebook_id": notebook_id,
         "filename": url, "chunks": 0, "error": None,
         "pdf_mode": pdf_mode, "chunking_strategy": strategy, "started_at": time.time()
     }
-    bg.add_task(url_pipeline, job_id, url, document_id, notebook_id, callback_url, pdf_mode, strategy)
+    bg.add_task(url_pipeline, job_id, url, document_id, notebook_id, callback_url, pdf_mode,
+                strategy, image_opts)
     return {"job_id": job_id, "status": "queued"}
 
 @app.post("/research-url")
@@ -547,6 +568,15 @@ async def search(
         }
         if p.get("page_num"):
             item["page_num"] = p.get("page_num")
+        # Multimodale Chunks: Bilddaten an Laravel durchreichen (ADR-0003).
+        if p.get("has_image"):
+            item["has_image"]  = True
+            item["image_b64"]  = p.get("image_b64", "")
+            item["image_hash"] = p.get("image_hash", "")
+            if p.get("source_url"):
+                item["source_url"] = p.get("source_url")
+            if p.get("image_url"):
+                item["image_url"] = p.get("image_url")
         out.append(item)
     return {"results": out}
 
@@ -633,20 +663,25 @@ def prepare_audio(content, filename):
             os.unlink(out_path)
 
 def pipeline(job_id, content, filename, document_id, notebook_id, callback_url, pdf_mode="basic",
-             existing_transcript=None, chunking_strategy="fixed"):
+             existing_transcript=None, chunking_strategy="fixed", image_opts=None):
     """
     pdf_mode:
         'basic'              – nur Text via Tika (Standard)
-        'vision_description' – Bilder via Vision-LLM beschreiben
+        'vision_description' – jede Seite als Bild an Vision-LLM, Ergebnis = Textbeschreibungen
+        'multimodal'         – Text (Tika) + Raster-Figuren (PyMuPDF) mit Vision-Captions,
+                               Figuren werden als eigenständige Chunks mit has_image=True gespeichert
     existing_transcript: vorhandenes Transkript-Dict (spart Re-Transkription beim Reindex)
     chunking_strategy:
         'fixed'    – feste Wort-Anzahl pro Chunk (Standard)
         'semantic' – Embedding-basierte Splits an inhaltlichen Grenzen
+    image_opts: dict mit pdf_figure_min_pixels / url_image_* (siehe /process Endpoint).
     """
+    image_opts = image_opts or {}
     try:
         jobs[job_id]["status"] = "processing"
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
         transcript_data = None
+        pdf_figures = []
         if ext in AUDIO_EXTENSIONS:
             if existing_transcript and existing_transcript.get("full_text"):
                 # Vorhandenes Transkript wiederverwenden – keine erneute Transkription
@@ -664,6 +699,15 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url, 
             if ext_lower == "pdf" and pdf_mode == "vision_description":
                 jobs[job_id]["step"] = "extracting (vision)"
                 text = extract_pdf_with_vision(content, job_id)
+            elif ext_lower == "pdf" and pdf_mode == "multimodal":
+                # Text bleibt Tika-basiert; zusätzlich Figuren extrahieren
+                text = extract(content)
+                jobs[job_id]["step"] = "extracting figures"
+                pdf_figures = extract_pdf_figures(
+                    content,
+                    min_pixels=int(image_opts.get("pdf_figure_min_pixels", 40000)),
+                    job_id=job_id,
+                )
             else:
                 text = extract(content)
         has_text = bool(text and len(text.strip()) >= 10)
@@ -699,6 +743,13 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url, 
         embed_texts = [c.get("contextualized_text", c["text"]) for c in chunks]
         embeddings = embed(embed_texts, job_id=job_id)
 
+        # Figuren-Embeddings (auf Caption-Text)
+        fig_embeddings = []
+        if pdf_figures:
+            jobs[job_id]["step"] = "embedding figures"
+            fig_texts = [f["caption"] for f in pdf_figures]
+            fig_embeddings = embed(fig_texts, job_id=job_id)
+
         jobs[job_id]["step"] = "storing"
         points = [
             PointStruct(id=str(uuid.uuid4()), vector=emb, payload={
@@ -711,10 +762,27 @@ def pipeline(job_id, content, filename, document_id, notebook_id, callback_url, 
             })
             for i, (c, emb) in enumerate(zip(chunks, embeddings))
         ]
+        # Figuren als eigenständige multimodale Chunks
+        base_idx = len(chunks)
+        for j, (fig, emb) in enumerate(zip(pdf_figures, fig_embeddings)):
+            points.append(PointStruct(id=str(uuid.uuid4()), vector=emb, payload={
+                "text":          fig["caption"],
+                "original_text": fig["caption"],
+                "parent_text":   fig["caption"],
+                "context":       "",
+                "notebook_id":   notebook_id,
+                "document_id":   document_id,
+                "filename":      filename,
+                "chunk_index":   base_idx + j,
+                "has_image":     True,
+                "image_b64":     fig["image_b64"],
+                "image_hash":    fig["image_hash"],
+                "page_num":      fig["page_num"],
+            }))
         for i in range(0, len(points), 100):
             qdrant.upsert(collection_name=COLLECTION, points=points[i:i+100])
 
-        total_chunks = len(chunks)
+        total_chunks = len(chunks) + len(pdf_figures)
         jobs[job_id]["status"] = "ready"
         jobs[job_id]["step"] = "done"
         jobs[job_id]["chunks"] = total_chunks
@@ -859,10 +927,14 @@ def discover_links(html, base_url):
     return list(links)[:MAX_CRAWL_PAGES]
 
 def url_pipeline(job_id, url, document_id, notebook_id, callback_url, pdf_mode="basic",
-                 chunking_strategy="fixed"):
+                 chunking_strategy="fixed", image_opts=None):
     """URL(s) laden, Text extrahieren, chunken, embedden, speichern.
     chunking_strategy: 'fixed' (Default) oder 'semantic' (Embedding-basierte Splits).
+    image_opts: wenn url_image_extraction_enabled=True, werden <img>-Tags der geladenen
+                Seiten extrahiert, per Vision-LLM beschrieben und als multimodale Chunks
+                gespeichert (has_image=True).
     """
+    image_opts = image_opts or {}
     try:
         jobs[job_id]["status"] = "processing"
         jobs[job_id]["step"] = "fetching"
@@ -871,8 +943,11 @@ def url_pipeline(job_id, url, document_id, notebook_id, callback_url, pdf_mode="
 
         main_text, main_title, main_html = fetch_page(url)
         all_texts = []
+        page_htmls = []  # (page_url, html) für Bildextraktion
         if main_text and len(main_text.strip()) > 10:
             all_texts.append(f"=== {main_title} – {url} ===\n{main_text}")
+        if main_html:
+            page_htmls.append((url, main_html))
 
         # Bei Domain-Root: Unterseiten crawlen
         if is_domain_root(url):
@@ -887,6 +962,8 @@ def url_pipeline(job_id, url, document_id, notebook_id, callback_url, pdf_mode="
                         all_texts.append(f"=== {page_title} – {link} ===\n{page_text}")
                         log.info("Job %s: crawled %d/%d – %s (%d chars)",
                                  job_id, i + 1, len(links), link, len(page_text))
+                        if page_html:
+                            page_htmls.append((link, page_html))
                     else:
                         log.info("Job %s: skipped %s (no content)", job_id, link)
                 except Exception as ex:
@@ -927,6 +1004,25 @@ def url_pipeline(job_id, url, document_id, notebook_id, callback_url, pdf_mode="
         embed_texts = [c.get("contextualized_text", c["text"]) for c in chunks]
         embeddings = embed(embed_texts, job_id=job_id)
 
+        # URL-Bilder extrahieren (falls aktiviert)
+        url_images = []
+        if image_opts.get("url_image_extraction_enabled") and page_htmls:
+            jobs[job_id]["step"] = "extracting images"
+            min_px = int(image_opts.get("url_image_min_pixels", 10000))
+            max_per = int(image_opts.get("url_image_max_per_page", 15))
+            for page_url, page_html in page_htmls:
+                imgs = extract_url_images(page_html, page_url, min_pixels=min_px,
+                                          max_per_page=max_per, job_id=job_id)
+                for im in imgs:
+                    im["page_url"] = page_url
+                url_images.extend(imgs)
+
+        img_embeddings = []
+        if url_images:
+            jobs[job_id]["step"] = "embedding images"
+            img_texts = [im["caption"] for im in url_images]
+            img_embeddings = embed(img_texts, job_id=job_id)
+
         jobs[job_id]["step"] = "storing"
         points = [
             PointStruct(id=str(uuid.uuid4()), vector=emb, payload={
@@ -939,14 +1035,33 @@ def url_pipeline(job_id, url, document_id, notebook_id, callback_url, pdf_mode="
             })
             for i, (c, emb) in enumerate(zip(chunks, embeddings))
         ]
+        # URL-Bilder als eigenständige multimodale Chunks
+        base_idx = len(chunks)
+        for j, (im, emb) in enumerate(zip(url_images, img_embeddings)):
+            points.append(PointStruct(id=str(uuid.uuid4()), vector=emb, payload={
+                "text":          im["caption"],
+                "original_text": im["caption"],
+                "parent_text":   im["caption"],
+                "context":       "",
+                "notebook_id":   notebook_id,
+                "document_id":   document_id,
+                "filename":      url,
+                "chunk_index":   base_idx + j,
+                "has_image":     True,
+                "image_b64":     im["image_b64"],
+                "image_hash":    im["image_hash"],
+                "source_url":    im.get("page_url", im["source_url"]),
+                "image_url":     im["source_url"],
+            }))
         for i in range(0, len(points), 100):
             qdrant.upsert(collection_name=COLLECTION, points=points[i:i + 100])
 
-        total = len(chunks)
+        total = len(chunks) + len(url_images)
         jobs[job_id]["status"] = "ready"
         jobs[job_id]["step"] = "done"
         jobs[job_id]["chunks"] = total
-        log.info("Job %s: done, %d Text-Chunks gespeichert", job_id, len(chunks))
+        log.info("Job %s: done, %d Text-Chunks + %d Bild-Chunks gespeichert",
+                 job_id, len(chunks), len(url_images))
         if callback_url:
             notify(callback_url, job_id, document_id, "ready", total,
                    usage=jobs[job_id].get("usage"))
@@ -1032,6 +1147,222 @@ def extract_pdf_with_vision(content: bytes, job_id: str = "") -> str:
     except Exception as e:
         log.error("PDF Vision-Extraktion fehlgeschlagen: %s – Fallback auf Tika", e)
         return extract(content)
+
+
+def _caption_image_b64(b64_png: str, hint: str = "", job_id: str = "") -> str:
+    """GPT-4o-Caption für ein einzelnes base64-PNG. Gibt leeren String bei Fehler."""
+    try:
+        prompt = (
+            "Beschreibe den Inhalt dieses Bildes knapp aber sachlich auf Deutsch. "
+            "Fasse Diagramme, Tabellen, Screenshots oder Illustrationen so zusammen, "
+            "dass ein Text-Chatbot das Bild später anhand der Beschreibung wiederfindet. "
+            "2–4 Sätze, keine Einleitung."
+        )
+        if hint:
+            prompt += f"\n\nKontext aus der Umgebung: {hint[:400]}"
+        response = oai.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_png}"}},
+                    {"type": "text", "text": prompt},
+                ]
+            }],
+            max_tokens=250,
+        )
+        caption = (response.choices[0].message.content or "").strip()
+        if job_id and job_id in jobs:
+            usage = jobs[job_id].setdefault("usage", {})
+            usage["vision_calls"]       = usage.get("vision_calls", 0) + 1
+            usage["context_tokens_in"]  = usage.get("context_tokens_in", 0) + (response.usage.prompt_tokens or 0)
+            usage["context_tokens_out"] = usage.get("context_tokens_out", 0) + (response.usage.completion_tokens or 0)
+            usage["context_model"]      = CHAT_MODEL
+        return caption
+    except Exception as e:
+        log.warning("Job %s: Bild-Caption fehlgeschlagen: %s", job_id, e)
+        return ""
+
+
+def extract_pdf_figures(content: bytes, min_pixels: int = 40000, job_id: str = "") -> list:
+    """
+    Raster-Bilder/Figuren aus einem PDF extrahieren.
+
+    Für jedes Bild auf jeder Seite:
+      - nur behalten wenn width*height >= min_pixels (filtert Icons/Ornamente)
+      - als PNG-base64 kodieren
+      - GPT-4o-Caption erzeugen
+      - Seitentext-Ausschnitt als Hint anhängen
+
+    Returns: [{page_num, image_b64, caption, image_hash, figure_index}, ...]
+    """
+    try:
+        import fitz
+        import base64 as _b64
+        import hashlib
+    except ImportError:
+        log.warning("PyMuPDF fehlt – Figure-Extraktion übersprungen")
+        return []
+
+    figures = []
+    try:
+        doc = fitz.open(stream=content, filetype="pdf")
+        for page_num, page in enumerate(doc, start=1):
+            page_text = ""
+            try:
+                page_text = page.get_text().strip()
+            except Exception:
+                pass
+
+            images = []
+            try:
+                images = page.get_images(full=True)
+            except Exception as e:
+                log.warning("Job %s: get_images Seite %d fehlgeschlagen: %s", job_id, page_num, e)
+                continue
+
+            for img_idx, img_info in enumerate(images):
+                xref = img_info[0]
+                try:
+                    pix = fitz.Pixmap(doc, xref)
+                    # CMYK/Alpha → RGB konvertieren
+                    if pix.n - pix.alpha >= 4:
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    w, h = pix.width, pix.height
+                    if (w * h) < min_pixels:
+                        pix = None
+                        continue
+                    png_bytes = pix.tobytes("png")
+                    pix = None
+                except Exception as e:
+                    log.warning("Job %s: Figure %d/Seite %d skip: %s", job_id, img_idx, page_num, e)
+                    continue
+
+                b64_png = _b64.b64encode(png_bytes).decode("utf-8")
+                caption = _caption_image_b64(b64_png, hint=page_text, job_id=job_id)
+                if not caption:
+                    caption = f"Abbildung auf Seite {page_num} des Dokuments."
+                img_hash = hashlib.sha256(png_bytes).hexdigest()[:16]
+                figures.append({
+                    "page_num":      page_num,
+                    "image_b64":     b64_png,
+                    "caption":       caption,
+                    "image_hash":    img_hash,
+                    "figure_index":  img_idx,
+                    "width":         w,
+                    "height":        h,
+                })
+        doc.close()
+        log.info("Job %s: %d PDF-Figuren extrahiert (min_pixels=%d)", job_id, len(figures), min_pixels)
+    except Exception as e:
+        log.error("Job %s: PDF-Figure-Extraktion fehlgeschlagen: %s", job_id, e)
+    return figures
+
+
+def _resolve_img_src(src: str, base_url: str) -> str:
+    """Absolute URL aus src herleiten, data:-URIs verwerfen."""
+    if not src:
+        return ""
+    src = src.strip()
+    if src.startswith("data:"):
+        return ""
+    if src.startswith("//"):
+        parsed = urlparse(base_url)
+        return f"{parsed.scheme}:{src}"
+    return urljoin(base_url, src)
+
+
+def extract_url_images(html: str, page_url: str, min_pixels: int = 10000,
+                       max_per_page: int = 15, job_id: str = "") -> list:
+    """
+    Bilder aus HTML einer Webseite extrahieren.
+
+    - <img src="..."> finden (inkl. srcset/data-src Fallback)
+    - absolute URL bilden, data:-URIs und bekannte Tracker-Pixel filtern
+    - Bild laden, Dimensionen prüfen (>= min_pixels)
+    - bis zu max_per_page Bilder behalten
+    - GPT-4o-Caption pro Bild
+
+    Returns: [{source_url, image_b64, caption, image_hash}, ...]
+    """
+    try:
+        import fitz
+        import base64 as _b64
+        import hashlib
+    except ImportError:
+        log.warning("PyMuPDF fehlt – URL-Bild-Extraktion übersprungen")
+        return []
+
+    # <img>-Tags grob einsammeln (reicht für statisches HTML; JS-rendered Images werden nicht erfasst)
+    img_matches = re.findall(r'<img\b[^>]*>', html, re.IGNORECASE)
+    candidates = []
+    seen = set()
+    for tag in img_matches:
+        src = ""
+        for attr in ("src", "data-src", "data-lazy-src", "data-original"):
+            m = re.search(rf'{attr}\s*=\s*["\']([^"\']+)["\']', tag, re.IGNORECASE)
+            if m:
+                src = m.group(1)
+                break
+        alt_m = re.search(r'alt\s*=\s*["\']([^"\']*)["\']', tag, re.IGNORECASE)
+        alt_text = alt_m.group(1).strip() if alt_m else ""
+        abs_url = _resolve_img_src(src, page_url)
+        if not abs_url or abs_url in seen:
+            continue
+        low = abs_url.lower()
+        if any(s in low for s in ("pixel.", "/tracking/", "1x1.gif", "spacer.gif")):
+            continue
+        seen.add(abs_url)
+        candidates.append((abs_url, alt_text))
+
+    images = []
+    fetched = 0
+    for abs_url, alt_text in candidates:
+        if fetched >= max_per_page:
+            break
+        try:
+            with httpx.Client(timeout=URL_TIMEOUT, follow_redirects=True) as c:
+                r = c.get(abs_url, headers={"User-Agent": URL_USER_AGENT})
+                r.raise_for_status()
+                img_bytes = r.content
+            if not img_bytes or len(img_bytes) < 500:
+                continue
+            try:
+                pix = fitz.Pixmap(img_bytes)
+                if pix.n - pix.alpha >= 4:
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                w, h = pix.width, pix.height
+                if (w * h) < min_pixels:
+                    pix = None
+                    continue
+                png_bytes = pix.tobytes("png")
+                pix = None
+            except Exception as e:
+                log.info("Job %s: URL-Bild konnte nicht dekodiert werden (%s): %s", job_id, abs_url, e)
+                continue
+        except Exception as e:
+            log.info("Job %s: URL-Bild Fetch fehlgeschlagen (%s): %s", job_id, abs_url, e)
+            continue
+
+        b64_png = _b64.b64encode(png_bytes).decode("utf-8")
+        hint = alt_text
+        caption = _caption_image_b64(b64_png, hint=hint, job_id=job_id)
+        if not caption:
+            caption = alt_text or f"Bild von {abs_url}"
+        img_hash = hashlib.sha256(png_bytes).hexdigest()[:16]
+        images.append({
+            "source_url":  abs_url,
+            "image_b64":   b64_png,
+            "caption":     caption,
+            "image_hash":  img_hash,
+            "width":       w,
+            "height":      h,
+        })
+        fetched += 1
+
+    log.info("Job %s: %d URL-Bilder extrahiert aus %s (min_pixels=%d)",
+             job_id, len(images), page_url, min_pixels)
+    return images
 
 
 def transcribe(content, filename):
