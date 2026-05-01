@@ -274,6 +274,185 @@ def auth(authorization: str = Header(None)):
 async def health():
     return {"status": "ok", "active_jobs": len([j for j in jobs.values() if j["status"] == "processing"])}
 
+
+# === Document-Templates v2 ===
+# Briefpapier (1-2 Seiten) + Sample-PDF -> Field-Map; Field-Map + Context -> PDF.
+# Siehe docs/documents-feature-v2.md §10.
+from template_engine import analyze_template, render_template, render_preview_pages
+
+
+@app.post("/template/analyze")
+async def template_analyze(
+    letterhead_pdf: UploadFile = File(...),
+    sample_pdf: UploadFile = File(...),
+    language: str = Form("de"),
+    type: str = Form("invoice"),
+    authorization: str = Header(None),
+):
+    """Briefpapier + Sample analysieren, Field-Map-Vorschlaege zurueckgeben."""
+    auth(authorization)
+    try:
+        letterhead_bytes = await letterhead_pdf.read()
+        sample_bytes = await sample_pdf.read()
+        if not letterhead_bytes or not sample_bytes:
+            raise HTTPException(400, "letterhead_pdf und sample_pdf werden benoetigt.")
+        result = await asyncio.to_thread(
+            analyze_template,
+            letterhead_bytes,
+            sample_bytes,
+            language=language,
+            doc_type=type,
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("template_analyze failed: %s", e)
+        raise HTTPException(500, f"analyze failed: {e}")
+
+
+@app.post("/template/render")
+async def template_render(request: Request, authorization: str = Header(None)):
+    """Field-Map + Context -> PDF (mode=final) oder PNG-Previews (mode=preview)."""
+    auth(authorization)
+    try:
+        body = await request.json()
+        lh_b64 = body.get("letterhead_pdf_b64")
+        if not lh_b64:
+            raise HTTPException(400, "letterhead_pdf_b64 fehlt.")
+        try:
+            import base64 as _b64
+            letterhead_bytes = _b64.b64decode(lh_b64)
+        except Exception:
+            raise HTTPException(400, "letterhead_pdf_b64 ist kein gueltiges Base64.")
+        field_map = body.get("field_map") or []
+        context = body.get("context") or {}
+        mode = (body.get("mode") or "final").lower()
+        if mode not in ("final", "preview"):
+            raise HTTPException(400, "mode muss 'final' oder 'preview' sein.")
+        result = await asyncio.to_thread(
+            render_template, letterhead_bytes, field_map, context, mode=mode
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("template_render failed: %s", e)
+        raise HTTPException(500, f"render failed: {e}")
+
+
+@app.post("/template/preview-pages")
+async def template_preview_pages(request: Request, authorization: str = Header(None)):
+    """Briefpapier-Seiten als PNG (base64) + Pt/Px-Dimensionen fuer den Drag-Editor."""
+    auth(authorization)
+    try:
+        body = await request.json()
+        lh_b64 = body.get("letterhead_pdf_b64")
+        if not lh_b64:
+            raise HTTPException(400, "letterhead_pdf_b64 fehlt.")
+        dpi = int(body.get("dpi", 96))
+        try:
+            import base64 as _b64
+            letterhead_bytes = _b64.b64decode(lh_b64)
+        except Exception:
+            raise HTTPException(400, "letterhead_pdf_b64 ist kein gueltiges Base64.")
+        pages = await asyncio.to_thread(render_preview_pages, letterhead_bytes, dpi=dpi)
+        return {"pages": pages}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("template_preview_pages failed: %s", e)
+        raise HTTPException(500, f"preview-pages failed: {e}")
+
+
+@app.post("/template/thumbnail")
+async def template_thumbnail(request: Request, authorization: str = Header(None)):
+    """Erste Output-Seite als JPEG-Thumbnail (max 300px breit) fuer die Index-Liste."""
+    auth(authorization)
+    try:
+        body = await request.json()
+        lh_b64 = body.get("letterhead_pdf_b64")
+        if not lh_b64:
+            raise HTTPException(400, "letterhead_pdf_b64 fehlt.")
+        try:
+            import base64 as _b64
+            letterhead_bytes = _b64.b64decode(lh_b64)
+        except Exception:
+            raise HTTPException(400, "letterhead_pdf_b64 ist kein gueltiges Base64.")
+        field_map = body.get("field_map") or []
+        context = body.get("context") or {}
+        max_width = int(body.get("max_width", 300))
+
+        def _build_thumb() -> str:
+            import fitz, io as _io, base64 as _bb
+            rendered = render_template(letterhead_bytes, field_map, context, mode="final")
+            pdf_bytes = _bb.b64decode(rendered["pdf_b64"])
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            try:
+                page = doc.load_page(0)
+                scale = max_width / float(page.rect.width)
+                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                buf = _io.BytesIO()
+                # JPEG-Qualitaet 80, Pillow ueber pix.pil_save
+                pix.pil_save(buf, format="JPEG", quality=80, optimize=True)
+                return _bb.b64encode(buf.getvalue()).decode("ascii")
+            finally:
+                doc.close()
+
+        png_b64 = await asyncio.to_thread(_build_thumb)
+        return {"png_b64": png_b64}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("template_thumbnail failed: %s", e)
+        raise HTTPException(500, f"thumbnail failed: {e}")
+
+
+@app.post("/pdf/thumbnail")
+async def pdf_thumbnail(request: Request, authorization: str = Header(None)):
+    """Erste Seite eines beliebigen PDFs als JPEG-Thumbnail (max max_width breit).
+
+    Reine PyMuPDF-Operation, keine Field-Map noetig - gedacht fuer den
+    Document-Index, der vom bereits gespeicherten Final-PDF nur das Vorschau-
+    Bild braucht (kein Re-Render).
+    """
+    auth(authorization)
+    try:
+        body = await request.json()
+        pdf_b64 = body.get("pdf_b64")
+        if not pdf_b64:
+            raise HTTPException(400, "pdf_b64 fehlt.")
+        try:
+            import base64 as _b64
+            pdf_bytes = _b64.b64decode(pdf_b64)
+        except Exception:
+            raise HTTPException(400, "pdf_b64 ist kein gueltiges Base64.")
+        max_width = int(body.get("max_width", 240))
+
+        def _build_thumb() -> str:
+            import fitz, io as _io, base64 as _bb
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            try:
+                if doc.page_count == 0:
+                    raise ValueError("PDF enthaelt keine Seiten.")
+                page = doc.load_page(0)
+                scale = max_width / float(page.rect.width)
+                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                buf = _io.BytesIO()
+                pix.pil_save(buf, format="JPEG", quality=80, optimize=True)
+                return _bb.b64encode(buf.getvalue()).decode("ascii")
+            finally:
+                doc.close()
+
+        png_b64 = await asyncio.to_thread(_build_thumb)
+        return {"png_b64": png_b64}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("pdf_thumbnail failed: %s", e)
+        raise HTTPException(500, f"pdf thumbnail failed: {e}")
+
+
 @app.post("/embed-test")
 async def embed_test(authorization: str = Header(None)):
     """Minimaler Embedding-Test: Einen kurzen Text embedden und Vektor-Dimension zurückgeben."""

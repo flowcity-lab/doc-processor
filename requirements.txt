@@ -8,4 +8,5 @@ trafilatura
 sentence-transformers
 numpy
 pymupdf
+qrcode[pil]
 
