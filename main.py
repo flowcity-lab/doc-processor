@@ -453,6 +453,71 @@ async def pdf_thumbnail(request: Request, authorization: str = Header(None)):
         raise HTTPException(500, f"pdf thumbnail failed: {e}")
 
 
+# === DOCX-Rendering fuer die VGSE-Invoice-Pipeline (Phase 2 / 5) ===
+# Erlaubt dem ai-gateway, eine .docx-Vorlage in PNG-Seiten umzuwandeln (Vision-
+# Grounding fuer Claude) sowie die in der Vorlage referenzierten Fonts gegen das
+# System abzugleichen (Upload-Time Font-Warning).
+from docx_render import render_docx_to_pages, inspect_fonts
+
+
+@app.post("/docx/render-pages")
+async def docx_render_pages(request: Request, authorization: str = Header(None)):
+    """DOCX (base64) -> Liste von PNG-Seiten {page, width_px, height_px, png_b64}.
+
+    Body:
+        { "docx_b64": "...", "dpi": 110, "max_pages": 12 }
+    """
+    auth(authorization)
+    try:
+        body = await request.json()
+        docx_b64 = body.get("docx_b64")
+        if not docx_b64:
+            raise HTTPException(400, "docx_b64 fehlt.")
+        try:
+            import base64 as _b64
+            docx_bytes = _b64.b64decode(docx_b64)
+        except Exception:
+            raise HTTPException(400, "docx_b64 ist kein gueltiges Base64.")
+        dpi = int(body.get("dpi", 110))
+        max_pages = int(body.get("max_pages", 12))
+        pages = await asyncio.to_thread(
+            render_docx_to_pages, docx_bytes, dpi=dpi, max_pages=max_pages
+        )
+        return {"pages": pages, "page_count": len(pages)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("docx_render_pages failed: %s", e)
+        raise HTTPException(500, f"docx render failed: {e}")
+
+
+@app.post("/docx/inspect-fonts")
+async def docx_inspect_fonts(request: Request, authorization: str = Header(None)):
+    """DOCX-Font-Diagnose fuer den Upload-Schritt im Trainer-Tool.
+
+    Body: { "docx_b64": "..." }
+    Response: { referenced: [...], missing: [...], embedded: bool, has_fc_list: bool }
+    """
+    auth(authorization)
+    try:
+        body = await request.json()
+        docx_b64 = body.get("docx_b64")
+        if not docx_b64:
+            raise HTTPException(400, "docx_b64 fehlt.")
+        try:
+            import base64 as _b64
+            docx_bytes = _b64.b64decode(docx_b64)
+        except Exception:
+            raise HTTPException(400, "docx_b64 ist kein gueltiges Base64.")
+        result = await asyncio.to_thread(inspect_fonts, docx_bytes)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("docx_inspect_fonts failed: %s", e)
+        raise HTTPException(500, f"font inspect failed: {e}")
+
+
 @app.post("/embed-test")
 async def embed_test(authorization: str = Header(None)):
     """Minimaler Embedding-Test: Einen kurzen Text embedden und Vektor-Dimension zurückgeben."""
